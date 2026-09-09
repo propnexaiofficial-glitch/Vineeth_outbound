@@ -628,6 +628,42 @@ class GeminiBridge:
             ]
         )
 
+        # FIX: installed google-genai SDK versions vary in whether
+        # SpeechConfig declares a `language_code` field. Older versions'
+        # SpeechConfig model does NOT have this field, and since these
+        # models are built with extra="forbid", passing language_code=
+        # unconditionally raises:
+        #   ValidationError: 1 validation error for SpeechConfig
+        #   language_code -> Extra inputs are not permitted [extra_forbidden]
+        # (This is exactly what crashed bridge.start() with
+        # AGENT_LANGUAGE='hi-IN'.)
+        #
+        # The real fix is to upgrade google-genai (`pip install --upgrade
+        # google-genai`) so SpeechConfig supports language_code natively.
+        # This guard just makes start() resilient in the meantime instead
+        # of hard-crashing every call: it only passes language_code
+        # through if the installed SDK's SpeechConfig actually accepts it.
+        speech_config_kwargs = {
+            "voice_config": _types.VoiceConfig(
+                prebuilt_voice_config=_types.PrebuiltVoiceConfig(
+                    voice_name=GEMINI_VOICE
+                )
+            ),
+        }
+
+        _speech_config_fields = getattr(_types.SpeechConfig, "model_fields", {})
+        if "language_code" in _speech_config_fields:
+            speech_config_kwargs["language_code"] = AGENT_LANGUAGE
+        else:
+            logger.warning(
+                f"[{self.call_sid}] Installed google-genai SpeechConfig has no "
+                f"'language_code' field — skipping (AGENT_LANGUAGE={AGENT_LANGUAGE!r} "
+                f"will NOT be applied; the session will use the model's default "
+                f"speech language). Run `pip install --upgrade google-genai` to fix."
+            )
+
+        speech_config = _types.SpeechConfig(**speech_config_kwargs)
+
         config = _types.LiveConnectConfig(
             response_modalities=["AUDIO"],
 
@@ -638,14 +674,7 @@ class GeminiBridge:
                 parts=[_types.Part(text=system_prompt)],
             ),
 
-            speech_config=_types.SpeechConfig(
-                voice_config=_types.VoiceConfig(
-                    prebuilt_voice_config=_types.PrebuiltVoiceConfig(
-                        voice_name=GEMINI_VOICE
-                    )
-                ),
-                language_code=AGENT_LANGUAGE,
-            ),
+            speech_config=speech_config,
 
             output_audio_transcription=_types.AudioTranscriptionConfig(),
             input_audio_transcription=_types.AudioTranscriptionConfig(),
