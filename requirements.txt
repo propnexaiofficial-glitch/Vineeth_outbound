@@ -1,0 +1,28 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets>=13.0,<15.0
+google-genai==1.9.0
+google-cloud-aiplatform>=1.38.0
+httpx>=0.28.1
+python-dotenv==1.0.1
+numpy==1.26.4
+pydantic==2.7.4
+python-multipart>=0.0.9
+# audioop removed in Python 3.13+
+audioop-lts>=0.2.1; python_version >= "3.13"
+# LiveKit
+livekit>=0.17.0
+livekit-api>=0.6.0
+# OCR and file parsing
+pdfplumber>=0.11.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+PyMuPDF>=1.23.0
+# MongoDB driver
+pymongo>=4.6.0
+# PostgreSQL driver
+psycopg2-binary>=2.9.9
+# SSE streaming
+sse-starlette>=1.6.5
+# Structured logging
+structlog>=24.1.0
