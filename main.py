@@ -100,8 +100,9 @@ os.makedirs(_TRANSCRIPT_DIR, exist_ok=True)
 
 async def _standalone_call_end(call_sid: str, transcript: str, collected_info, recording_path: str = None):
     """Save transcript + collected info to a timestamped file after every standalone call."""
+    call_sid = str(call_sid)   # ensure call_sid is always a string — safe against int/None inputs
+    safe_call_sid = re.sub(r'[<>:"/\\|?*]', "_", call_sid)   # strip filesystem-unsafe chars — will never crash
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_call_sid = re.sub(r'[<>:"/\\|?*]', "_", call_sid)
     filename = os.path.join(_TRANSCRIPT_DIR, f"{ts}_{safe_call_sid}.txt")
     lines = [
         f"Call SID : {call_sid}",
