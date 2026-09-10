@@ -31,7 +31,7 @@ _CALL_SAMPLE_RATE = 8000
 _BONVOICE_CHUNK_BYTES = 320          # 320 bytes = 160 samples = 20ms @ 8kHz/16-bit/mono
 _TRANSFER_STAFF_NUMBER = "9550335589"
 
-_RECORDINGS_DIR = r"D:\SchoolKnot\SchoolKnot Inbound\Addmission Gemini\Salezx-Voice-agent-main\voice_agent\recordings"
+_RECORDINGS_DIR = r"D:\SchoolKnot\SchoolKnot Outbound\Addmission Gemini\Salezx-Voice-agent-main\voice_agent\recordings"
 _CLEAR_EVENT_NAME = "clear"
 _PCM_8K_BYTES_PER_MS = 16.0          # 8000 samples/s * 2 bytes / 1000 ms
 
