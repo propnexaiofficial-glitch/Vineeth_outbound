@@ -2,11 +2,6 @@ from __future__ import annotations
 from typing import Literal, Optional
 import random
 
-# ============================================================
-# CONFIG  (same school info as inbound — copy-paste from your
-# existing org_config / prompts.py if it changes)
-# ============================================================
-
 AGENT_NAME = "Ananya"
 SCHOOL_NAME = "Solitaire Global Schools"
 SCHOOL_LEGAL_NAME = "Solitaire Global Schools"

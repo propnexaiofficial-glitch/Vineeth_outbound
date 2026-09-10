@@ -1,5 +1,4 @@
 import asyncio
-import audioop
 import base64
 import json
 import logging
@@ -21,12 +20,20 @@ logger = logging.getLogger(__name__)
 
 _SILENCE_TIMEOUT_SECONDS = 15
 _SILENCE_CHECK_INTERVAL_SECONDS = 2
+
+# Bonvoice "Inbound Media Streams v3" spec: audio is ALWAYS raw PCM,
+# 16-bit signed, 8000 Hz, mono — both directions — in exact 320-byte
+# (20ms) frames. No a-law / mu-law / linear8 negotiation exists on this
+# vendor; anything sent that isn't PCM16 or isn't a multiple of 320
+# bytes "will fail" per their doc, so we no longer do any audio-format
+# conversion here at all.
 _CALL_SAMPLE_RATE = 8000
+_BONVOICE_CHUNK_BYTES = 320          # 320 bytes = 160 samples = 20ms @ 8kHz/16-bit/mono
 _TRANSFER_STAFF_NUMBER = "9550335589"
 
 _RECORDINGS_DIR = r"D:\SchoolKnot\SchoolKnot Inbound\Addmission Gemini\Salezx-Voice-agent-main\voice_agent\recordings"
-_ORBITEL_CLEAR_EVENT_NAME = "clear"
-_PCM_8K_BYTES_PER_MS = 16.0
+_CLEAR_EVENT_NAME = "clear"
+_PCM_8K_BYTES_PER_MS = 16.0          # 8000 samples/s * 2 bytes / 1000 ms
 
 _PACING_LOOKAHEAD_MS = 200
 _TRANSFER_GRACE_PERIOD_SECONDS = 3.0
@@ -37,10 +44,12 @@ _RINGBACK_FREQ_2_HZ = 480.0
 _RINGBACK_ON_MS = 2000
 _RINGBACK_OFF_MS = 4000
 _RINGBACK_AMPLITUDE = 0.25          # 0.0-1.0, keep modest so it isn't jarring
-_RINGBACK_CHUNK_MS = 20             # matches typical telephony frame size
+_RINGBACK_CHUNK_MS = 20             # 20ms @ 8kHz/16-bit/mono == exactly 320 bytes,
+                                     # matching Bonvoice's required frame size
+
 
 def _normalize_datetime(raw: Optional[str], call_id: str = "") -> str:
-    
+
     if not raw:
         return ""
     try:
@@ -90,7 +99,6 @@ class WsCallHandler:
         self._call_context       = call_context
         self._is_outbound        = is_outbound
         self._outbound_intro     = outbound_intro
-        self._audio_format       = "alaw"
         self._started            = False
         self._caller_number      = ""
         self._channel_id         = ""
@@ -107,6 +115,20 @@ class WsCallHandler:
         self._playback_started_at: Optional[float] = None
         self._playback_ms_scheduled = 0.0
         self._resolved_api_key: Optional[str] = None
+
+        # Bonvoice identifies a call's media stream by "stream_id" (sent
+        # to us on the 'start' event). Every outgoing 'media'/'clear'
+        # event we send back MUST carry this exact stream_id — it is NOT
+        # the same thing as call_id, and Bonvoice's platform will not
+        # know which stream a message belongs to without it.
+        self._stream_id          = ""
+
+        # Bonvoice requires every outgoing audio frame to be EXACTLY (a
+        # multiple of) 320 bytes. Whatever comes out of Gemini's output
+        # queue won't naturally be aligned to that, so we buffer any
+        # leftover partial frame here and prepend it to the next chunk.
+        self._outgoing_leftover  = b""
+        self._outgoing_packet_id = 0
 
         # Ringback tone (see _ringback_sender): plays from the moment the
         # call connects until the agent's first real audio chunk is ready,
@@ -128,6 +150,10 @@ class WsCallHandler:
         _RINGBACK_ON_MS / _RINGBACK_OFF_MS cadence. `elapsed_ms` is the
         time since the ringback started, used to decide tone-on vs
         tone-off and to keep the waveform phase-continuous across chunks.
+
+        With chunk_ms=20 this always returns exactly 320 bytes (160
+        samples * 2 bytes), matching Bonvoice's required frame size
+        exactly — no extra chunking needed for ringback frames.
         """
         cycle_ms = _RINGBACK_ON_MS + _RINGBACK_OFF_MS
         position_in_cycle = elapsed_ms % cycle_ms
@@ -164,22 +190,8 @@ class WsCallHandler:
                     break
 
                 pcm_chunk = self._generate_ringback_chunk_pcm16(elapsed_ms)
-                try:
-                    outgoing_chunk = self._outgoing_from_pcm16(pcm_chunk)
-                except Exception as e:
-                    logger.warning(f"[{self.call_id}] Ringback audio conversion failed: {e}")
-                    outgoing_chunk = pcm_chunk
-
-                try:
-                    await self.ws.send_text(json.dumps({
-                        "event": "media",
-                        "call_id": self.call_id,
-                        "media": {
-                            "payload": base64.b64encode(outgoing_chunk).decode("ascii"),
-                        },
-                    }))
-                except (WebSocketDisconnect, RuntimeError) as e:
-                    logger.info(f"[{self.call_id}] Socket closed while sending ringback ({e}).")
+                sent_ok = await self._send_media_frame(pcm_chunk)
+                if not sent_ok:
                     break
 
                 elapsed_ms += _RINGBACK_CHUNK_MS
@@ -191,28 +203,53 @@ class WsCallHandler:
         finally:
             logger.info(f"[{self.call_id}] Ringback sender stopped after {elapsed_ms:.0f}ms.")
 
-    def _incoming_to_pcm16(self, raw_bytes: bytes) -> bytes:
-        """Convert audio as received from the client into PCM16."""
-        if self._audio_format == "alaw":
-            return audioop.alaw2lin(raw_bytes, 2)
-        if self._audio_format == "mulaw":
-            return audioop.ulaw2lin(raw_bytes, 2)
-        if self._audio_format == "linear8":
-            # raw 8-bit UNSIGNED linear PCM -> 16-bit signed linear PCM
-            return audioop.bias(audioop.lin2lin(raw_bytes, 1, 2), 2, -32768)
-        # already pcm16 (or unrecognized format — pass through unchanged)
-        return raw_bytes
+    def _next_packet_id(self) -> int:
+        self._outgoing_packet_id += 1
+        return self._outgoing_packet_id
 
-    def _outgoing_from_pcm16(self, pcm16_bytes: bytes) -> bytes:
-        """Convert PCM16 audio back into whatever format the client
-        negotiated in the 'start' event."""
-        if self._audio_format == "alaw":
-            return audioop.lin2alaw(pcm16_bytes, 2)
-        if self._audio_format == "mulaw":
-            return audioop.lin2ulaw(pcm16_bytes, 2)
-        if self._audio_format == "linear8":
-            return audioop.lin2lin(audioop.bias(pcm16_bytes, 2, 32768), 2, 1)
-        return pcm16_bytes
+    async def _send_media_frame(self, pcm16_frame: bytes) -> bool:
+        """Send exactly one Bonvoice 'media' event. `pcm16_frame` must
+        already be sized to a multiple of _BONVOICE_CHUNK_BYTES (320
+        bytes) — callers are responsible for chunking/buffering before
+        calling this (see _send_pcm16_media for the buffered path used
+        for real agent audio). Returns False if the socket is closed.
+        """
+        try:
+            await self.ws.send_text(json.dumps({
+                "event": "media",
+                "stream_id": self._stream_id,
+                "media": {
+                    "packet_id": self._next_packet_id(),
+                    "timestamp": int(time.time() * 1000),
+                    "payload": base64.b64encode(pcm16_frame).decode("ascii"),
+                },
+            }))
+            return True
+        except (WebSocketDisconnect, RuntimeError) as e:
+            logger.info(f"[{self.call_id}] Socket closed while sending media ({e}).")
+            return False
+        except Exception as e:
+            logger.error(f"[{self.call_id}] Failed to send media frame: {e}")
+            return False
+
+    async def _send_pcm16_media(self, pcm16_bytes: bytes) -> bool:
+        """Buffer + split arbitrary-length PCM16 audio into Bonvoice's
+        required 320-byte (20ms @ 8kHz/16-bit/mono) frames and send each
+        as its own 'media' event. Any leftover bytes that don't fill a
+        full 320-byte frame are held in self._outgoing_leftover and
+        prepended to the next call. Returns False if the socket closed
+        mid-send (caller should stop sending).
+        """
+        data = self._outgoing_leftover + pcm16_bytes
+        n_full_frames = len(data) // _BONVOICE_CHUNK_BYTES
+
+        for i in range(n_full_frames):
+            frame = data[i * _BONVOICE_CHUNK_BYTES: (i + 1) * _BONVOICE_CHUNK_BYTES]
+            if not await self._send_media_frame(frame):
+                return False
+
+        self._outgoing_leftover = data[n_full_frames * _BONVOICE_CHUNK_BYTES:]
+        return True
 
     async def run(self):
         """Main loop: receive JSON messages over the WebSocket, dispatch to Gemini."""
@@ -244,9 +281,13 @@ class WsCallHandler:
                         logger.warning(f"[{self.call_id}] Got media before start — ignoring.")
                         continue
 
-                    audio_b64 = msg.get("audio", "")
-                    if not audio_b64 and isinstance(msg.get("media"), dict):
+                    # Bonvoice shape: {"event":"media","stream_id":...,
+                    # "media":{"packet_id":...,"timestamp":...,"payload":...}}
+                    audio_b64 = ""
+                    if isinstance(msg.get("media"), dict):
                         audio_b64 = msg["media"].get("payload", "")
+                    if not audio_b64:
+                        audio_b64 = msg.get("audio", "")
 
                     if audio_b64 and self.bridge:
                         try:
@@ -254,12 +295,9 @@ class WsCallHandler:
                         except Exception:
                             logger.warning(f"[{self.call_id}] Bad base64 audio payload.")
                             continue
-                        try:
-                            audio_bytes = self._incoming_to_pcm16(audio_bytes)
-                        except Exception as e:
-                            logger.warning(f"[{self.call_id}] Audio format conversion failed: {e}")
-                            continue
 
+                        # Already raw PCM16 8kHz mono per Bonvoice spec —
+                        # no format conversion needed.
                         await self.bridge.send_audio(audio_bytes)
 
                         if self.recorder:
@@ -273,15 +311,16 @@ class WsCallHandler:
                     logger.info(f"[{self.call_id}] 'connected' event received, waiting for 'start'.")
 
                 elif event == "transfer":
-                    logger.info(f"[{self.call_id}] Sent 'transfer' event: {msg}")
+                    logger.info(f"[{self.call_id}] Received 'transfer' event: {msg}")
 
                 elif event == "clear":
-            
-                    logger.info(f"[{self.call_id}] Sent 'clear' event — resetting playback state.")
+
+                    logger.info(f"[{self.call_id}] Received 'clear' event — resetting playback state.")
                     if self.bridge:
                         self.bridge._interrupted_flag = True
                     self._playback_started_at = None
                     self._playback_ms_scheduled = 0.0
+                    self._outgoing_leftover = b""
 
                 else:
                     logger.warning(f"[{self.call_id}] Unknown event type: {event!r}")
@@ -297,46 +336,33 @@ class WsCallHandler:
     async def _handle_start(self, msg: dict):
         if self._started:
             return
-        start_data = msg.get("start", {}) or {}
 
-        incoming_call_id = start_data.get("call_sid") or msg.get("call_id")
+        # Bonvoice shape: {"event":"start","data":{"stream_id":...,
+        # "call_id":...,"from":...,"to":...}}
+        start_data = msg.get("data", {}) or {}
+
+        self._stream_id = start_data.get("stream_id") or msg.get("stream_id") or ""
+        if not self._stream_id:
+            logger.warning(
+                f"[{self.call_id}] No stream_id in start event — outgoing "
+                f"media/clear events won't be attributable to a stream. "
+                f"Raw start event: {json.dumps(msg)}"
+            )
+
+        incoming_call_id = start_data.get("call_id") or msg.get("call_id")
         if incoming_call_id:
             self.call_id = incoming_call_id
             logger.info(f"[{self.call_id}] call_id received from start event.")
         else:
             logger.warning(
-                f"[{self.call_id}] No call_sid in start event — using generated "
+                f"[{self.call_id}] No call_id in start event — using generated "
                 f"fallback ID. Raw start event: {json.dumps(msg)}"
-            )
-
-        media_format = start_data.get("media_format", {}) or {}
-        encoding = media_format.get("encoding", "")  # e.g. "audio/alaw"
-        if encoding:
-            # "audio/alaw" -> "alaw", "audio/x-mulaw" -> "mulaw", etc.
-            self._audio_format = encoding.split("/")[-1].replace("x-", "") or self._audio_format
-        else:
-            self._audio_format = msg.get("audio_format") or self._audio_format
-
-        incoming_sample_rate = media_format.get("sample_rate")
-        if incoming_sample_rate and int(incoming_sample_rate) != _CALL_SAMPLE_RATE:
-            logger.warning(
-                f"[{self.call_id}] Vendor sample_rate={incoming_sample_rate!r} "
-                f"differs from configured _CALL_SAMPLE_RATE={_CALL_SAMPLE_RATE} "
-                f"— audio will sound wrong (pitch/speed) unless resampled."
             )
 
         self._lead_name     = msg.get("lead_name") or self._lead_name
         self._lead_company  = msg.get("lead_company") or self._lead_company
         self._prompt_type   = msg.get("prompt_type") or self._prompt_type
         self._is_outbound   = msg.get("is_outbound", self._is_outbound)
-
-        logger.info(f"[{self.call_id}] Negotiated audio_format={self._audio_format!r}")
-        if self._audio_format not in ("alaw", "mulaw", "linear8", "pcm16"):
-            logger.warning(
-                f"[{self.call_id}] Unrecognized audio_format={self._audio_format!r} "
-                f"— audio will be passed through UNCONVERTED. Confirm the exact "
-                f"format string with the telephony vendor."
-            )
 
         # Start ringback tone RIGHT NOW — before the CRM lookup and Gemini
         # bridge setup below, which can take a moment. This fills that gap
@@ -480,6 +506,19 @@ class WsCallHandler:
 
         logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog tasks created.")
 
+    async def _close_socket(self):
+        """Bonvoice's spec defines no client-to-platform 'stop'/end-call
+        event — the only documented events are start/media/clear/transfer,
+        all of which are either inbound-only (start) or unrelated to
+        ending the call. Ending the call is therefore just: close this
+        WebSocket connection.
+        """
+        try:
+            if self.ws.client_state == WebSocketState.CONNECTED:
+                await self.ws.close()
+        except Exception:
+            pass
+
     async def _hangup_watchdog(self):
         """
         Safety-net fallback only. The PRIMARY, correct way a normal call
@@ -546,17 +585,7 @@ class WsCallHandler:
                         f"({elapsed:.1f}s after call_should_end, queue_drained="
                         f"{queue_drained}) — closing call now."
                     )
-                    try:
-                        await self.ws.send_text(json.dumps({
-                            "event": "stop",
-                            "call_id": self.call_id,
-                        }))
-                    except Exception:
-                        pass
-                    try:
-                        await self.ws.close()
-                    except Exception:
-                        pass
+                    await self._close_socket()
                     break
 
         except asyncio.CancelledError:
@@ -575,7 +604,6 @@ class WsCallHandler:
                 if self.ws.client_state != WebSocketState.CONNECTED:
                     break
 
-
                 if getattr(self.bridge, "call_should_end", False):
                     break
 
@@ -586,27 +614,15 @@ class WsCallHandler:
                         f"(threshold {_SILENCE_TIMEOUT_SECONDS}s) — treating as "
                         f"an abandoned call and ending it."
                     )
-                    try:
-                        await self.ws.send_text(json.dumps({
-                            "event": "stop",
-                            "call_id": self.call_id,
-                        }))
-                        logger.info(f"[{self.call_id}] Sent 'stop' event — silence timeout.")
-                    except Exception:
-                        pass
-                    try:
-                        await self.ws.close()
-                    except Exception:
-                        pass
+                    await self._close_socket()
                     break
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"[{self.call_id}] Silence watcher error: {e}")
 
-
     @staticmethod
-    def _to_transfer_target(staff_number: str):
+    def _to_transfer_target(staff_number: str) -> str:
         if not staff_number:
             return ""
         digits = "".join(ch for ch in staff_number if ch.isdigit())
@@ -625,14 +641,15 @@ class WsCallHandler:
             )
             return
 
+        # Bonvoice shape: {"event":"transfer","transferTo":"{phone_number}"}
         payload = {
             "event": "transfer",
-            "target": int(target) if target.isdigit() else target,
+            "transferTo": target,
         }
         try:
             await self.ws.send_text(json.dumps(payload))
             self._transfer_event_sent = True
-            logger.info(f"[{self.call_id}] Sent 'transfer' event to vendor — payload={payload}")
+            logger.info(f"[{self.call_id}] Sent 'transfer' event to Bonvoice — payload={payload}")
         except (WebSocketDisconnect, RuntimeError) as e:
             logger.info(f"[{self.call_id}] Could not send transfer event (socket closed): {e}")
         except Exception as e:
@@ -663,7 +680,6 @@ class WsCallHandler:
         except Exception as e:
             logger.error(f"[{self.call_id}] Failed to send transfer event: {e}")
 
-        
         await self._send_transfer_event(staff_number)
         if self._enquiry_id:
             try:
@@ -685,16 +701,17 @@ class WsCallHandler:
                 f"[{self.call_id}] Transfer queued — will be sent with new-enquiry batch at call end."
             )
 
-    async def _send_orbitel_clear(self):
+    async def _send_clear_event(self):
         self._clear_generation += 1
         try:
+            # Bonvoice shape: {"event":"clear","stream_id":...}
             await self.ws.send_text(json.dumps({
-                "event": _ORBITEL_CLEAR_EVENT_NAME,
-                "call_id": self.call_id,
+                "event": _CLEAR_EVENT_NAME,
+                "stream_id": self._stream_id,
             }))
             logger.info(
-                f"[{self.call_id}] Sent '{_ORBITEL_CLEAR_EVENT_NAME}' event to "
-                f"Orbitel — caller interruption (generation {self._clear_generation})."
+                f"[{self.call_id}] Sent '{_CLEAR_EVENT_NAME}' event to "
+                f"Bonvoice — caller interruption (generation {self._clear_generation})."
             )
         except (WebSocketDisconnect, RuntimeError) as e:
             logger.info(f"[{self.call_id}] Could not send clear event (socket closed): {e}")
@@ -709,9 +726,10 @@ class WsCallHandler:
             while True:
                 if getattr(self.bridge, "_interrupted_flag", False):
                     self.bridge._interrupted_flag = False
-                    await self._send_orbitel_clear()
+                    await self._send_clear_event()
                     self._playback_started_at = None
                     self._playback_ms_scheduled = 0.0
+                    self._outgoing_leftover = b""
                 try:
                     chunk = await asyncio.wait_for(
                         self.bridge.output_queue.get(), timeout=0.5
@@ -720,21 +738,9 @@ class WsCallHandler:
                     self._playback_started_at = None
                     self._playback_ms_scheduled = 0.0
 
-
                     if getattr(self.bridge, "call_should_end", False):
                         logger.info(f"[{self.call_id}] call_should_end detected (idle queue) — closing gracefully.")
-                        try:
-                            await self.ws.send_text(json.dumps({
-                                "event": "stop",
-                                "call_id": self.call_id,
-                            }))
-                        except (WebSocketDisconnect, RuntimeError):
-                            pass
-                        try:
-                            if self.ws.client_state == WebSocketState.CONNECTED:
-                                await self.ws.close()
-                        except Exception:
-                            pass
+                        await self._close_socket()
                         break
                     if (
                         self._transfer_requested
@@ -747,15 +753,9 @@ class WsCallHandler:
                             continue
                         logger.info(
                             f"[{self.call_id}] Transfer requested (idle queue) — "
-                            f"grace period elapsed, sending stop."
+                            f"grace period elapsed, closing socket."
                         )
-                        try:
-                            await self.ws.send_text(json.dumps({
-                                "event": "stop",
-                                "call_id": self.call_id,
-                            }))
-                        except (WebSocketDisconnect, RuntimeError):
-                            pass
+                        await self._close_socket()
                         break
                     continue
 
@@ -780,10 +780,12 @@ class WsCallHandler:
 
                 if getattr(self.bridge, "_interrupted_flag", False):
                     self.bridge._interrupted_flag = False
-                    await self._send_orbitel_clear()
+                    await self._send_clear_event()
                     self._playback_started_at = None
                     self._playback_ms_scheduled = 0.0
+                    self._outgoing_leftover = b""
                     continue
+
                 chunk_ms = len(chunk) / _PCM_8K_BYTES_PER_MS
                 now = time.monotonic()
                 if self._playback_started_at is None:
@@ -803,22 +805,10 @@ class WsCallHandler:
                     logger.info(f"[{self.call_id}] Socket no longer connected, stopping sender.")
                     break
 
-                try:
-                    outgoing_chunk = self._outgoing_from_pcm16(chunk)
-                except Exception as e:
-                    logger.warning(f"[{self.call_id}] Outgoing audio conversion failed: {e}")
-                    outgoing_chunk = chunk
-
-                try:
-                    await self.ws.send_text(json.dumps({
-                        "event": "media",
-                        "call_id": self.call_id,
-                        "media": {
-                            "payload": base64.b64encode(outgoing_chunk).decode("ascii"),
-                        },
-                    }))
-                except (WebSocketDisconnect, RuntimeError) as e:
-                    logger.info(f"[{self.call_id}] Socket closed while sending ({e}); stopping sender.")
+                # chunk is already raw PCM16 8kHz mono — split/pad into
+                # Bonvoice's required 320-byte frames and send.
+                if not await self._send_pcm16_media(chunk):
+                    logger.info(f"[{self.call_id}] Socket closed while sending; stopping sender.")
                     break
 
                 if getattr(self.bridge, "transfer_requested", False) and not self._transfer_requested:
@@ -834,30 +824,13 @@ class WsCallHandler:
                     and self._transfer_notified_at is not None
                     and (time.monotonic() - self._transfer_notified_at) >= _TRANSFER_GRACE_PERIOD_SECONDS
                 ):
-                    try:
-                        await self.ws.send_text(json.dumps({
-                            "event": "stop",
-                            "call_id": self.call_id,
-                        }))
-                        logger.info(f"[{self.call_id}] Sent 'stop' event — transfer handoff (grace period elapsed).")
-                    except (WebSocketDisconnect, RuntimeError):
-                        pass
+                    logger.info(f"[{self.call_id}] Closing socket — transfer handoff (grace period elapsed).")
+                    await self._close_socket()
                     break
 
                 if getattr(self.bridge, "call_should_end", False) and self.bridge.output_queue.empty():
-                    try:
-                        await self.ws.send_text(json.dumps({
-                            "event": "stop",
-                            "call_id": self.call_id,
-                        }))
-                        logger.info(f"[{self.call_id}] Sent 'stop' event — call ending naturally.")
-                    except (WebSocketDisconnect, RuntimeError):
-                        pass
-                    try:
-                        if self.ws.client_state == WebSocketState.CONNECTED:
-                            await self.ws.close()
-                    except Exception:
-                        pass
+                    logger.info(f"[{self.call_id}] Closing socket — call ending naturally.")
+                    await self._close_socket()
                     break
 
         except asyncio.CancelledError:
@@ -995,7 +968,7 @@ class WsCallHandler:
                     ))
 
             else:
-               
+
                 note_parts = []
                 if callback_time:
                     note_parts.append(f"Callback requested: {callback_time}")
@@ -1160,12 +1133,7 @@ class WsCallHandler:
         except Exception as e:
             logger.error(f"[{self.call_id}] Failed to save call record to MongoDB: {e}")
 
-        try:
-
-            if self.ws.client_state == WebSocketState.CONNECTED:
-                await self.ws.close()
-        except Exception:
-            pass
+        await self._close_socket()
 
         if self._on_call_end:
             if asyncio.iscoroutinefunction(self._on_call_end):
