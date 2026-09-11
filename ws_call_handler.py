@@ -1140,6 +1140,1180 @@
 #                 await self._on_call_end(self.call_id, transcript, collected_info, recording_path)
 #             else:
 #                 self._on_call_end(self.call_id, transcript, collected_info, recording_path)
+# import asyncio
+# import base64
+# import json
+# import logging
+# import math
+# import struct
+# import time
+# import uuid
+# from datetime import datetime, timezone
+# from typing import Optional
+
+# from fastapi import WebSocket, WebSocketDisconnect
+# from starlette.websockets import WebSocketState
+
+# from gemini_bridge import GeminiBridge
+# from call_recorder import CallRecorder
+# import schoolknot_api
+
+# logger = logging.getLogger(__name__)
+
+# _SILENCE_TIMEOUT_SECONDS = 15
+# _SILENCE_CHECK_INTERVAL_SECONDS = 2
+
+# # Bonvoice "Inbound Media Streams v3" spec: audio is ALWAYS raw PCM,
+# # 16-bit signed, 8000 Hz, mono -- both directions -- in exact 320-byte
+# # (20ms) frames. No a-law / mu-law / linear8 negotiation exists on this
+# # vendor; anything sent that isn't PCM16 or isn't a multiple of 320
+# # bytes "will fail" per their doc, so we no longer do any audio-format
+# # conversion here at all.
+# _CALL_SAMPLE_RATE = 8000
+# _BONVOICE_CHUNK_BYTES = 320          # 320 bytes = 160 samples = 20ms @ 8kHz/16-bit/mono
+# _TRANSFER_STAFF_NUMBER = "9550335589"
+
+# _RECORDINGS_DIR = r"D:\SchoolKnot\SchoolKnot Outbound\Addmission Gemini\Salezx-Voice-agent-main\voice_agent\recordings"
+# _CLEAR_EVENT_NAME = "clear"
+# _PCM_8K_BYTES_PER_MS = 16.0          # 8000 samples/s * 2 bytes / 1000 ms
+
+# _PACING_LOOKAHEAD_MS = 200
+# _TRANSFER_GRACE_PERIOD_SECONDS = 3.0
+# _HANGUP_WATCHDOG_GRACE_SECONDS = 8.0
+
+# _RINGBACK_FREQ_1_HZ = 440.0
+# _RINGBACK_FREQ_2_HZ = 480.0
+# _RINGBACK_ON_MS = 2000
+# _RINGBACK_OFF_MS = 4000
+# _RINGBACK_AMPLITUDE = 0.25          # 0.0-1.0, keep modest so it isn't jarring
+# _RINGBACK_CHUNK_MS = 20             # 20ms @ 8kHz/16-bit/mono == exactly 320 bytes,
+#                                      # matching Bonvoice's required frame size
+
+
+# def _normalize_datetime(raw: Optional[str], call_id: str = "") -> str:
+
+#     if not raw:
+#         return ""
+#     try:
+#         from dateutil import parser as dtparser
+#         dt = dtparser.parse(raw, fuzzy=True, default=datetime.now())
+#         normalized = dt.strftime("%Y-%m-%d %H:%M:%S")
+#         if normalized != raw:
+#             logger.info(
+#                 f"[{call_id}] Normalized date {raw!r} -> {normalized!r} "
+#                 f"before sending to SchoolKnot."
+#             )
+#         return normalized
+#     except Exception as e:
+#         logger.warning(
+#             f"[{call_id}] Could not parse date {raw!r} ({e}) -- sending "
+#             f"empty string instead of an unparseable value."
+#         )
+#         return ""
+
+
+# class WsCallHandler:
+#     def __init__(
+#         self,
+#         websocket: WebSocket,
+#         on_call_end=None,
+#         lead_id: str = "",
+#         initial_info=None,
+#         prompt_type: str = "sales",
+#         lead_name: str = "there",
+#         lead_company: str = "",
+#         call_context: str = "",
+#         is_outbound: bool = False,
+#         outbound_intro: Optional[str] = None,
+#         outbound_context: Optional[dict] = None,
+#     ):
+#         self.ws                = websocket
+#         self.call_id            = f"unknown-{uuid.uuid4().hex[:12]}"
+#         self.bridge: Optional[GeminiBridge] = None
+#         self.recorder: Optional[CallRecorder] = None
+#         self._sender_task        = None
+#         self._silence_watcher_task = None
+#         self._on_call_end        = on_call_end
+#         self._lead_id            = lead_id
+#         self._initial_info       = initial_info
+#         self._prompt_type        = prompt_type
+#         self._lead_name          = lead_name
+#         self._lead_company       = lead_company
+#         self._call_context       = call_context
+#         self._is_outbound        = is_outbound
+#         self._outbound_intro     = outbound_intro
+
+#         # Full lead/appointment context handed to us from the
+#         # /api/call/initiate request (via main.py's CALL_CONTEXT_STORE
+#         # lookup) -- e.g. student_name, grade, branch_name,
+#         # appointment_type/date/time, enquiry_status, call_purpose,
+#         # notes, enquiry_id. Used by _build_outbound_trigger() below to
+#         # make the agent's opening line specific to this call instead of
+#         # a generic "Hi, this is X calling" for every prompt_type.
+#         self._outbound_context   = outbound_context or {}
+
+#         self._started            = False
+#         self._caller_number      = ""
+#         self._channel_id         = ""
+#         self._caller_context: dict = {}
+#         self._enquiry_id: Optional[int] = None
+#         self._call_start_time: Optional[datetime] = None
+#         self._transfer_requested = False
+#         self._transfer_reason    = ""
+#         self._transfer_notified_at: Optional[float] = None
+#         self._transfer_event_sent = False
+#         self._pending_transfer_note: Optional[str] = None
+#         self._hangup_watchdog_task = None
+#         self._clear_generation = 0
+#         self._playback_started_at: Optional[float] = None
+#         self._playback_ms_scheduled = 0.0
+#         self._resolved_api_key: Optional[str] = None
+
+#         # Bonvoice identifies a call's media stream by "stream_id" (sent
+#         # to us on the 'start' event). Every outgoing 'media'/'clear'
+#         # event we send back MUST carry this exact stream_id -- it is NOT
+#         # the same thing as call_id, and Bonvoice's platform will not
+#         # know which stream a message belongs to without it.
+#         self._stream_id          = ""
+
+#         # Bonvoice requires every outgoing audio frame to be EXACTLY (a
+#         # multiple of) 320 bytes. Whatever comes out of Gemini's output
+#         # queue won't naturally be aligned to that, so we buffer any
+#         # leftover partial frame here and prepend it to the next chunk.
+#         self._outgoing_leftover  = b""
+#         self._outgoing_packet_id = 0
+
+#         # Ringback tone (see _ringback_sender): plays from the moment the
+#         # call connects until the agent's first real audio chunk is ready,
+#         # so the caller hears normal ringing instead of silence during
+#         # CRM lookup / LLM session setup.
+#         self._ringback_task = None
+#         self._ringback_stop_event = asyncio.Event()
+#         self._real_audio_started = False
+
+#         # Tracks when call_should_end first flipped True, so the hangup
+#         # watchdog can give _audio_sender a grace window to finish
+#         # streaming the agent's closing line before forcing the socket
+#         # closed (see _hangup_watchdog / _HANGUP_WATCHDOG_GRACE_SECONDS).
+#         self._call_should_end_seen_at: Optional[float] = None
+
+#     def _generate_ringback_chunk_pcm16(self, elapsed_ms: float, chunk_ms: int = _RINGBACK_CHUNK_MS) -> bytes:
+#         """Generate one chunk of standard dual-frequency ringback tone as
+#         PCM16 mono samples at _CALL_SAMPLE_RATE, gated on/off per the
+#         _RINGBACK_ON_MS / _RINGBACK_OFF_MS cadence.
+#         """
+#         cycle_ms = _RINGBACK_ON_MS + _RINGBACK_OFF_MS
+#         position_in_cycle = elapsed_ms % cycle_ms
+#         is_tone_on = position_in_cycle < _RINGBACK_ON_MS
+
+#         n_samples = int(_CALL_SAMPLE_RATE * chunk_ms / 1000.0)
+#         samples = bytearray()
+
+#         if not is_tone_on:
+#             return bytes(n_samples * 2)
+
+#         start_t = elapsed_ms / 1000.0
+#         for i in range(n_samples):
+#             t = start_t + (i / _CALL_SAMPLE_RATE)
+#             value = (
+#                 math.sin(2 * math.pi * _RINGBACK_FREQ_1_HZ * t)
+#                 + math.sin(2 * math.pi * _RINGBACK_FREQ_2_HZ * t)
+#             ) / 2.0
+#             sample = int(value * _RINGBACK_AMPLITUDE * 32767)
+#             sample = max(-32768, min(32767, sample))
+#             samples += struct.pack("<h", sample)
+
+#         return bytes(samples)
+
+#     async def _ringback_sender(self):
+#         """Streams standard ringback tone to the caller from call-connect
+#         time until the real agent audio is ready."""
+#         elapsed_ms = 0.0
+#         try:
+#             while not self._ringback_stop_event.is_set():
+#                 if self.ws.client_state != WebSocketState.CONNECTED:
+#                     break
+
+#                 pcm_chunk = self._generate_ringback_chunk_pcm16(elapsed_ms)
+#                 sent_ok = await self._send_media_frame(pcm_chunk)
+#                 if not sent_ok:
+#                     break
+
+#                 elapsed_ms += _RINGBACK_CHUNK_MS
+#                 await asyncio.sleep(_RINGBACK_CHUNK_MS / 1000.0)
+#         except asyncio.CancelledError:
+#             pass
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Ringback sender error: {e}")
+#         finally:
+#             logger.info(f"[{self.call_id}] Ringback sender stopped after {elapsed_ms:.0f}ms.")
+
+#     def _next_packet_id(self) -> int:
+#         self._outgoing_packet_id += 1
+#         return self._outgoing_packet_id
+
+#     async def _send_media_frame(self, pcm16_frame: bytes) -> bool:
+#         """Send exactly one Bonvoice 'media' event. `pcm16_frame` must
+#         already be sized to a multiple of _BONVOICE_CHUNK_BYTES (320
+#         bytes). Returns False if the socket is closed.
+#         """
+#         try:
+#             await self.ws.send_text(json.dumps({
+#                 "event": "media",
+#                 "stream_id": self._stream_id,
+#                 "media": {
+#                     "packet_id": self._next_packet_id(),
+#                     "timestamp": int(time.time() * 1000),
+#                     "payload": base64.b64encode(pcm16_frame).decode("ascii"),
+#                 },
+#             }))
+#             return True
+#         except (WebSocketDisconnect, RuntimeError) as e:
+#             logger.info(f"[{self.call_id}] Socket closed while sending media ({e}).")
+#             return False
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Failed to send media frame: {e}")
+#             return False
+
+#     async def _send_pcm16_media(self, pcm16_bytes: bytes) -> bool:
+#         """Buffer + split arbitrary-length PCM16 audio into Bonvoice's
+#         required 320-byte (20ms @ 8kHz/16-bit/mono) frames and send each
+#         as its own 'media' event.
+#         """
+#         data = self._outgoing_leftover + pcm16_bytes
+#         n_full_frames = len(data) // _BONVOICE_CHUNK_BYTES
+
+#         for i in range(n_full_frames):
+#             frame = data[i * _BONVOICE_CHUNK_BYTES: (i + 1) * _BONVOICE_CHUNK_BYTES]
+#             if not await self._send_media_frame(frame):
+#                 return False
+
+#         self._outgoing_leftover = data[n_full_frames * _BONVOICE_CHUNK_BYTES:]
+#         return True
+
+#     async def run(self):
+#         """Main loop: receive JSON messages over the WebSocket, dispatch to Gemini."""
+#         try:
+#             while True:
+#                 try:
+#                     raw = await self.ws.receive_text()
+#                 except WebSocketDisconnect:
+#                     logger.info(f"[{self.call_id}] WebSocket disconnected.")
+#                     break
+#                 except RuntimeError as e:
+#                     logger.info(f"[{self.call_id}] WebSocket runtime error (connection closed): {e}")
+#                     break
+
+#                 try:
+#                     msg = json.loads(raw)
+#                 except json.JSONDecodeError:
+#                     logger.warning(f"[{self.call_id}] Ignoring non-JSON message.")
+#                     continue
+
+#                 event = msg.get("event")
+
+#                 if event == "start":
+#                     logger.info(f"[RAW START EVENT] {json.dumps(msg)}")
+#                     await self._handle_start(msg)
+
+#                 elif event == "media":
+#                     if not self._started:
+#                         logger.warning(f"[{self.call_id}] Got media before start -- ignoring.")
+#                         continue
+
+#                     audio_b64 = ""
+#                     if isinstance(msg.get("media"), dict):
+#                         audio_b64 = msg["media"].get("payload", "")
+#                     if not audio_b64:
+#                         audio_b64 = msg.get("audio", "")
+
+#                     if audio_b64 and self.bridge:
+#                         try:
+#                             audio_bytes = base64.b64decode(audio_b64)
+#                         except Exception:
+#                             logger.warning(f"[{self.call_id}] Bad base64 audio payload.")
+#                             continue
+
+#                         await self.bridge.send_audio(audio_bytes)
+
+#                         if self.recorder:
+#                             await self.recorder.add_caller_audio(audio_bytes)
+
+#                 elif event == "stop":
+#                     logger.info(f"[{self.call_id}] Stop event received.")
+#                     break
+
+#                 elif event == "connected":
+#                     logger.info(f"[{self.call_id}] 'connected' event received, waiting for 'start'.")
+
+#                 elif event == "transfer":
+#                     logger.info(f"[{self.call_id}] Received 'transfer' event: {msg}")
+
+#                 elif event == "clear":
+#                     logger.info(f"[{self.call_id}] Received 'clear' event -- resetting playback state.")
+#                     if self.bridge:
+#                         self.bridge._interrupted_flag = True
+#                     self._playback_started_at = None
+#                     self._playback_ms_scheduled = 0.0
+#                     self._outgoing_leftover = b""
+
+#                 else:
+#                     logger.warning(f"[{self.call_id}] Unknown event type: {event!r}")
+
+#         except asyncio.CancelledError:
+#             logger.warning(f"[{self.call_id}] run() task was CANCELLED (this is usually why nothing else logs).")
+#             raise
+#         except Exception as e:
+#             logger.exception(f"[{self.call_id}] Unexpected error: {e}")
+#         finally:
+#             await self._cleanup()
+
+#     # -- Outbound greeting/trigger construction ------------------------
+
+#     def _build_outbound_trigger(self) -> str:
+#         """
+#         Builds the instruction sent to Gemini to kick off an outbound
+#         call, tailored to self._prompt_type using whatever fields are
+#         present in self._outbound_context (parent_name, student_name,
+#         grade, branch_name, appointment_type/date/time, enquiry_status,
+#         call_purpose, notes, enquiry_id -- all optional; only what
+#         SchoolKnot actually sent on /api/call/initiate will be present).
+
+#         This is what makes "the agent talks according to the API
+#         parameters" actually happen: prompt_type picks which script/tone
+#         to use, and the rest of the context fills in the specifics
+#         (which student, which branch, which appointment) so the agent
+#         doesn't have to ask the caller things we already know.
+#         """
+#         ctx = self._outbound_context
+#         parent_name    = ctx.get("parent_name") or self._lead_name or "there"
+#         student_name   = ctx.get("student_name")
+#         grade          = ctx.get("grade")
+#         branch_name    = ctx.get("branch_name")
+#         enquiry_status = ctx.get("enquiry_status")
+#         call_purpose   = ctx.get("call_purpose")
+#         notes          = ctx.get("notes")
+#         appt_type      = ctx.get("appointment_type")
+#         appt_date      = ctx.get("appointment_date")
+#         appt_time      = ctx.get("appointment_time")
+
+#         from config import AGENT_NAME, COMPANY_NAME
+
+#         known_bits = []
+#         if student_name:
+#             known_bits.append(f"student name: {student_name}")
+#         if grade:
+#             known_bits.append(f"grade/class: {grade}")
+#         if branch_name:
+#             known_bits.append(f"branch: {branch_name}")
+#         if enquiry_status:
+#             known_bits.append(f"current enquiry status: {enquiry_status}")
+#         if call_purpose:
+#             known_bits.append(f"reason for this call: {call_purpose}")
+#         if notes:
+#             known_bits.append(f"notes: {notes}")
+#         known_block = ("Known details -- " + "; ".join(known_bits) + ".") if known_bits else ""
+
+#         prompt_type = self._prompt_type
+
+#         if prompt_type == "outbound_reconfirmation":
+#             appt_bits = []
+#             if appt_type:
+#                 appt_bits.append(appt_type)
+#             if appt_date:
+#                 appt_bits.append(f"on {appt_date}")
+#             if appt_time:
+#                 appt_bits.append(f"at {appt_time}")
+#             appt_desc = " ".join(appt_bits) if appt_bits else "their upcoming appointment"
+
+#             instruction = (
+#                 f"IMPORTANT: This is an OUTBOUND appointment reconfirmation call. "
+#                 f"You are calling {parent_name} to confirm {appt_desc}"
+#                 + (f" for {student_name}" if student_name else "") + ". "
+#                 f"{known_block} "
+#                 f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME}, state the "
+#                 f"appointment details clearly, and ask them to confirm whether they "
+#                 f"can still make it, or would like to reschedule. Begin immediately."
+#             )
+
+#         elif prompt_type == "outbound_follow_up":
+#             instruction = (
+#                 f"IMPORTANT: This is an OUTBOUND follow-up call. You are calling "
+#                 f"{parent_name} to follow up on a previous enquiry"
+#                 + (f" for {student_name}" if student_name else "") + ". "
+#                 f"{known_block} "
+#                 f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME}, reference "
+#                 f"that this is a follow-up, and ask how you can help move things "
+#                 f"forward. Begin immediately."
+#             )
+
+#         elif prompt_type == "outbound_admission_reminder":
+#             instruction = (
+#                 f"IMPORTANT: This is an OUTBOUND admission deadline/process reminder "
+#                 f"call. You are calling {parent_name}"
+#                 + (f" regarding {student_name}'s admission" if student_name else " regarding their child's admission")
+#                 + ". "
+#                 f"{known_block} "
+#                 f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME}, remind them "
+#                 f"clearly and politely about the pending admission step or deadline, "
+#                 f"and offer help completing it. Begin immediately."
+#             )
+
+#         elif prompt_type == "outbound_event_invite":
+#             instruction = (
+#                 f"IMPORTANT: This is an OUTBOUND event invitation call. You are "
+#                 f"calling {parent_name} to invite them to a school event"
+#                 + (f" (relevant to {student_name})" if student_name else "") + ". "
+#                 f"{known_block} "
+#                 f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME}, describe "
+#                 f"the event and its date/time (ask the caller if not already known), "
+#                 f"and invite them warmly. Begin immediately."
+#             )
+
+#         elif prompt_type == "outbound_reengagement":
+#             instruction = (
+#                 f"IMPORTANT: This is an OUTBOUND re-engagement call. You are calling "
+#                 f"{parent_name}, whose enquiry has gone quiet for a while"
+#                 + (f" (regarding {student_name})" if student_name else "") + ". "
+#                 f"{known_block} "
+#                 f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME}, gently "
+#                 f"re-open the conversation, and find out if they're still "
+#                 f"interested or have questions. Begin immediately."
+#             )
+
+#         else:  # outbound_new_lead, or any unrecognized prompt_type -- safe generic default
+#             instruction = (
+#                 f"IMPORTANT: This is an OUTBOUND call to a new lead, {parent_name}"
+#                 + (f", regarding {student_name}" if student_name else "") + ". "
+#                 f"{known_block} "
+#                 f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME} and begin "
+#                 f"the conversation naturally based on their enquiry. Begin immediately."
+#             )
+
+#         return instruction
+
+#     async def _handle_start(self, msg: dict):
+#         if self._started:
+#             return
+
+#         # Bonvoice shape: {"event":"start","data":{"stream_id":...,
+#         # "call_id":...,"from":...,"to":...}}
+#         start_data = msg.get("data", {}) or {}
+
+#         self._stream_id = start_data.get("stream_id") or msg.get("stream_id") or ""
+#         if not self._stream_id:
+#             logger.warning(
+#                 f"[{self.call_id}] No stream_id in start event -- outgoing "
+#                 f"media/clear events won't be attributable to a stream. "
+#                 f"Raw start event: {json.dumps(msg)}"
+#             )
+
+#         incoming_call_id = start_data.get("call_id") or msg.get("call_id")
+#         if incoming_call_id:
+#             self.call_id = incoming_call_id
+#             logger.info(f"[{self.call_id}] call_id received from start event.")
+#         else:
+#             logger.warning(
+#                 f"[{self.call_id}] No call_id in start event -- using generated "
+#                 f"fallback ID. Raw start event: {json.dumps(msg)}"
+#             )
+
+#         self._lead_name     = msg.get("lead_name") or self._lead_name
+#         self._lead_company  = msg.get("lead_company") or self._lead_company
+#         self._prompt_type   = msg.get("prompt_type") or self._prompt_type
+#         self._is_outbound   = msg.get("is_outbound", self._is_outbound)
+
+#         logger.info(f"[{self.call_id}] Starting ringback tone while the call is being set up.")
+#         self._ringback_task = asyncio.create_task(self._ringback_sender())
+
+#         def _looks_like_phone_number(value: str) -> bool:
+#             if not value:
+#                 return False
+#             digits = value.lstrip("+").replace(" ", "").replace("-", "")
+#             return digits.isdigit() and len(digits) >= 7
+
+#         raw_lead_name = msg.get("lead_name") or ""
+#         self._caller_number = (
+#             start_data.get("from")
+#             or msg.get("caller_number")
+#             or msg.get("from")
+#             or msg.get("ani")
+#             or (raw_lead_name if _looks_like_phone_number(raw_lead_name) else "")
+#         )
+#         self._channel_id = (
+#             start_data.get("to")
+#             or msg.get("channel_id")
+#             or msg.get("did")
+#             or schoolknot_api.SCHOOLKNOT_CHANNEL_ID
+#         )
+
+#         self._call_start_time = datetime.now(timezone.utc)
+
+#         # -- Outbound calls: skip the CRM lookup, we already have the
+#         # context SchoolKnot gave us at /api/call/initiate time --------
+#         if self._is_outbound and self._outbound_context:
+#             enquiry_id_from_context = self._outbound_context.get("enquiry_id")
+#             self._enquiry_id = enquiry_id_from_context
+#             self._caller_context = {
+#                 "caller_status": "existing" if enquiry_id_from_context else "new",
+#                 **{k: v for k, v in self._outbound_context.items() if k != "enquiry_id"},
+#             }
+#             logger.info(
+#                 f"[{self.call_id}] Outbound call -- using context from "
+#                 f"/api/call/initiate directly, skipping CRM lookup. "
+#                 f"prompt_type={self._prompt_type!r}"
+#             )
+#         elif self._caller_number:
+#             logger.info(f"[{self.call_id}] Calling get_enquiry_details for {self._caller_number}...")
+#             try:
+#                 result = await schoolknot_api.get_enquiry_details(self._caller_number)
+#                 logger.info(f"[{self.call_id}] get_enquiry_details response: {result}")
+#             except Exception as e:
+#                 logger.exception(f"[{self.call_id}] get_enquiry_details FAILED")
+#                 result = None
+
+#             if result is None:
+#                 self._enquiry_id = None
+#                 self._caller_context = {"caller_status": "new"}
+#                 logger.warning(
+#                     f"[{self.call_id}] Enquiry lookup failed for "
+#                     f"{self._caller_number!r} -- proceeding as new caller "
+#                     f"so call data isn't lost."
+#                 )
+#             elif result.get("type") == 2 and result.get("data"):
+#                 records = result["data"]
+#                 primary = records[0]
+#                 self._enquiry_id = primary.get("enquiry_id")
+#                 self._caller_context = {
+#                     "caller_status": "existing",
+#                     "parent_name": primary.get("father_name") or primary.get("mother_name"),
+#                     "father_name": primary.get("father_name"),
+#                     "mother_name": primary.get("mother_name"),
+#                     "student_name": primary.get("student_name"),
+#                     "grade": primary.get("class_opted_for"),
+#                     "branch_name": primary.get("branch_name"),
+#                     "enquiry_status": primary.get("probability_name"),
+#                     "enquiry_created_date": primary.get("enquiry_created_date"),
+#                     "enquiry_academic_year": primary.get("enquiry_academic_year"),
+#                     "all_enquiries": records,
+#                 }
+#             else:
+#                 self._enquiry_id = None
+#                 self._caller_context = {"caller_status": "new"}
+#         else:
+#             logger.warning(f"[{self.call_id}] No caller number available on start event -- skipping lookup.")
+#             self._enquiry_id = None
+#             self._caller_context = {"caller_status": "new"}
+
+#         self.recorder = CallRecorder(
+#             call_sid=self.call_id,
+#             sample_rate=_CALL_SAMPLE_RATE,
+#             output_dir=_RECORDINGS_DIR,
+#         )
+
+#         logger.info(f"[{self.call_id}] Creating GeminiBridge instance...")
+#         self.bridge = GeminiBridge(
+#             call_sid=self.call_id,
+#             lead_id=self._lead_id,
+#             outbound_intro=self._outbound_intro,
+#             initial_info=self._initial_info,
+#             prompt_type=self._prompt_type,
+#             org_config=self._caller_context,
+#         )
+
+#         try:
+#             logger.info(f"[{self.call_id}] Calling bridge.start()...")
+#             await self.bridge.start(send_greeting=False)
+#             logger.info(f"[{self.call_id}] bridge.start() returned successfully.")
+#         except BaseException as e:
+#             logger.exception(f"[{self.call_id}] bridge.start() FAILED: {type(e).__name__}: {e}")
+#             raise
+
+#         # -- Build the trigger message that kicks off the conversation --
+#         if self._is_outbound:
+#             trigger = self._build_outbound_trigger()
+#         else:
+#             from config import AGENT_NAME, COMPANY_NAME
+#             if self._caller_context.get("caller_status") == "existing":
+#                 parent_name = self._caller_context.get("parent_name") or ""
+#                 trigger = (
+#                     f"IMPORTANT: This is a RETURNING caller -- see the "
+#                     f"'RETURNING CALLER -- CRM MATCH FOUND' section in your "
+#                     f"instructions for exactly who they are and what is "
+#                     f"already known about them. Greet them personally by "
+#                     f"name" + (f" ({parent_name})" if parent_name else "") +
+#                     f" instead of the standard first-time greeting, and "
+#                     f"begin immediately. Do not re-ask anything already "
+#                     f"listed as known in that section."
+#                 )
+#             else:
+#                 trigger = (
+#                     f"IMPORTANT: The lead's name is {self._lead_name!r}. Call type: {self._prompt_type}.\n"
+#                     f"Introduce yourself as {AGENT_NAME} from {COMPANY_NAME} and begin immediately."
+#                 )
+
+#         try:
+#             logger.info(f"[{self.call_id}] Sending trigger message to Gemini: {trigger}")
+#             await self.bridge._session.send_realtime_input(text=trigger)
+#             logger.info(f"[{self.call_id}] Gemini session started, greeting triggered.")
+#         except BaseException as e:
+#             logger.exception(f"[{self.call_id}] send_realtime_input FAILED: {type(e).__name__}: {e}")
+#             raise
+
+#         self._started = True
+#         self._sender_task = asyncio.create_task(self._audio_sender())
+#         self._silence_watcher_task = asyncio.create_task(self._silence_watcher())
+#         self._hangup_watchdog_task = asyncio.create_task(self._hangup_watchdog())
+
+#         logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog tasks created.")
+
+#     async def _close_socket(self):
+#         """Bonvoice's spec defines no client-to-platform 'stop'/end-call
+#         event -- ending the call is just: close this WebSocket connection.
+#         """
+#         try:
+#             if self.ws.client_state == WebSocketState.CONNECTED:
+#                 await self.ws.close()
+#         except Exception:
+#             pass
+
+#     async def _hangup_watchdog(self):
+#         """
+#         Safety-net fallback only. The PRIMARY, correct way a normal call
+#         ends is via _audio_sender.
+#         """
+#         if not self.bridge:
+#             return
+#         try:
+#             while True:
+#                 await asyncio.sleep(0.25)
+
+#                 if self.ws.client_state != WebSocketState.CONNECTED:
+#                     break
+
+#                 if getattr(self.bridge, "call_should_end", False):
+#                     if self._call_should_end_seen_at is None:
+#                         self._call_should_end_seen_at = time.monotonic()
+#                         logger.info(
+#                             f"[{self.call_id}] call_should_end observed -- starting "
+#                             f"{_HANGUP_WATCHDOG_GRACE_SECONDS:.0f}s grace period so the "
+#                             f"agent's closing line can finish streaming before this "
+#                             f"fallback watchdog would step in."
+#                         )
+
+#                     queue_drained = (
+#                         self.bridge.output_queue.empty()
+#                         if self.bridge and hasattr(self.bridge, "output_queue")
+#                         else True
+#                     )
+#                     elapsed = time.monotonic() - self._call_should_end_seen_at
+
+#                     if elapsed < _HANGUP_WATCHDOG_GRACE_SECONDS and not queue_drained:
+#                         continue
+#                     if elapsed < 1.0:
+#                         continue
+
+#                     logger.info(
+#                         f"[{self.call_id}] Hangup watchdog fallback firing "
+#                         f"({elapsed:.1f}s after call_should_end, queue_drained="
+#                         f"{queue_drained}) -- closing call now."
+#                     )
+#                     await self._close_socket()
+#                     break
+
+#         except asyncio.CancelledError:
+#             pass
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Hangup watchdog error: {e}")
+
+#     async def _silence_watcher(self):
+
+#         if not self.bridge:
+#             return
+#         try:
+#             while True:
+#                 await asyncio.sleep(_SILENCE_CHECK_INTERVAL_SECONDS)
+
+#                 if self.ws.client_state != WebSocketState.CONNECTED:
+#                     break
+
+#                 if getattr(self.bridge, "call_should_end", False):
+#                     break
+
+#                 idle = self.bridge.seconds_since_speech()
+#                 if idle >= _SILENCE_TIMEOUT_SECONDS:
+#                     logger.info(
+#                         f"[{self.call_id}] {idle:.1f}s of silence detected "
+#                         f"(threshold {_SILENCE_TIMEOUT_SECONDS}s) -- treating as "
+#                         f"an abandoned call and ending it."
+#                     )
+#                     await self._close_socket()
+#                     break
+#         except asyncio.CancelledError:
+#             pass
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Silence watcher error: {e}")
+
+#     @staticmethod
+#     def _to_transfer_target(staff_number: str) -> str:
+#         if not staff_number:
+#             return ""
+#         digits = "".join(ch for ch in staff_number if ch.isdigit())
+#         return digits or staff_number
+
+#     async def _send_transfer_event(self, staff_number: str):
+#         if self._transfer_event_sent:
+#             logger.info(f"[{self.call_id}] Transfer event already sent for this call -- skipping duplicate.")
+#             return
+
+#         target = self._to_transfer_target(staff_number)
+#         if not target:
+#             logger.warning(
+#                 f"[{self.call_id}] No usable staff number to build a "
+#                 f"'transfer' target from ({staff_number!r}) -- not sending."
+#             )
+#             return
+
+#         # Bonvoice shape: {"event":"transfer","transferTo":"{phone_number}"}
+#         payload = {
+#             "event": "transfer",
+#             "transferTo": target,
+#         }
+#         try:
+#             await self.ws.send_text(json.dumps(payload))
+#             self._transfer_event_sent = True
+#             logger.info(f"[{self.call_id}] Sent 'transfer' event to Bonvoice -- payload={payload}")
+#         except (WebSocketDisconnect, RuntimeError) as e:
+#             logger.info(f"[{self.call_id}] Could not send transfer event (socket closed): {e}")
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Failed to send transfer event: {e}")
+
+#     async def _maybe_request_warm_transfer(self):
+#         from datetime import datetime, timezone
+
+#         reason = self._transfer_reason or "caller_requested_human"
+#         staff_number = (
+#             getattr(self.bridge, "_transfer_destination", "") or _TRANSFER_STAFF_NUMBER
+#         )
+#         note = f"Live transfer requested -- reason: {reason}"
+
+#         try:
+#             await self.ws.send_text(json.dumps({
+#                 "event": "transfer_requested",
+#                 "call_id": self.call_id,
+#                 "reason": reason,
+#                 "staff_number": staff_number,
+#                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+#             }))
+#             self._transfer_notified_at = time.monotonic()
+#             logger.info(
+#                 f"[{self.call_id}] transfer_requested sent over WebSocket -> "
+#                 f"staff_number={staff_number!r}, reason={reason!r}"
+#             )
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Failed to send transfer event: {e}")
+
+#         await self._send_transfer_event(staff_number)
+#         if self._enquiry_id:
+#             try:
+#                 block = schoolknot_api.build_other_request_block(
+#                     requested_for=note,
+#                     enquiry_id=self._enquiry_id,
+#                 )
+#                 result = await schoolknot_api.insert_enquiry_service([block])
+#                 logger.info(f"[{self.call_id}] Transfer note logged to SchoolKnot: {result}")
+#             except Exception as e:
+#                 logger.error(
+#                     f"[{self.call_id}] insert_enquiry_service FAILED while logging "
+#                     f"transfer note (queuing for retry at call end): {e}"
+#                 )
+#                 self._pending_transfer_note = note
+#         else:
+#             self._pending_transfer_note = note
+#             logger.info(
+#                 f"[{self.call_id}] Transfer queued -- will be sent with new-enquiry batch at call end."
+#             )
+
+#     async def _send_clear_event(self):
+#         self._clear_generation += 1
+#         try:
+#             await self.ws.send_text(json.dumps({
+#                 "event": _CLEAR_EVENT_NAME,
+#                 "stream_id": self._stream_id,
+#             }))
+#             logger.info(
+#                 f"[{self.call_id}] Sent '{_CLEAR_EVENT_NAME}' event to "
+#                 f"Bonvoice -- caller interruption (generation {self._clear_generation})."
+#             )
+#         except (WebSocketDisconnect, RuntimeError) as e:
+#             logger.info(f"[{self.call_id}] Could not send clear event (socket closed): {e}")
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Failed to send clear event: {e}")
+
+#     async def _audio_sender(self):
+#         """Pulls audio chunks from Gemini's output queue and streams them to the client."""
+#         if not self.bridge:
+#             return
+#         try:
+#             while True:
+#                 if getattr(self.bridge, "_interrupted_flag", False):
+#                     self.bridge._interrupted_flag = False
+#                     await self._send_clear_event()
+#                     self._playback_started_at = None
+#                     self._playback_ms_scheduled = 0.0
+#                     self._outgoing_leftover = b""
+#                 try:
+#                     chunk = await asyncio.wait_for(
+#                         self.bridge.output_queue.get(), timeout=0.5
+#                     )
+#                 except asyncio.TimeoutError:
+#                     self._playback_started_at = None
+#                     self._playback_ms_scheduled = 0.0
+
+#                     if getattr(self.bridge, "call_should_end", False):
+#                         logger.info(f"[{self.call_id}] call_should_end detected (idle queue) -- closing gracefully.")
+#                         await self._close_socket()
+#                         break
+#                     if (
+#                         self._transfer_requested
+#                         and getattr(self.bridge, "_caller_has_spoken", False)
+#                     ):
+#                         if self._transfer_notified_at is None:
+#                             continue
+#                         elapsed = time.monotonic() - self._transfer_notified_at
+#                         if elapsed < _TRANSFER_GRACE_PERIOD_SECONDS:
+#                             continue
+#                         logger.info(
+#                             f"[{self.call_id}] Transfer requested (idle queue) -- "
+#                             f"grace period elapsed, closing socket."
+#                         )
+#                         await self._close_socket()
+#                         break
+#                     continue
+
+#                 if chunk is None:
+#                     break
+
+#                 if not self._real_audio_started:
+#                     self._real_audio_started = True
+#                     self._ringback_stop_event.set()
+#                     if self._ringback_task and not self._ringback_task.done():
+#                         self._ringback_task.cancel()
+#                         try:
+#                             await self._ringback_task
+#                         except asyncio.CancelledError:
+#                             pass
+#                         except Exception as e:
+#                             logger.error(f"[{self.call_id}] Error awaiting ringback task: {e}")
+#                     logger.info(f"[{self.call_id}] Ringback stopped -- real audio starting.")
+
+#                 if getattr(self.bridge, "_interrupted_flag", False):
+#                     self.bridge._interrupted_flag = False
+#                     await self._send_clear_event()
+#                     self._playback_started_at = None
+#                     self._playback_ms_scheduled = 0.0
+#                     self._outgoing_leftover = b""
+#                     continue
+
+#                 chunk_ms = len(chunk) / _PCM_8K_BYTES_PER_MS
+#                 now = time.monotonic()
+#                 if self._playback_started_at is None:
+#                     self._playback_started_at = now
+#                     self._playback_ms_scheduled = 0.0
+
+#                 target_time = self._playback_started_at + (self._playback_ms_scheduled / 1000.0)
+#                 sleep_needed = target_time - now - (_PACING_LOOKAHEAD_MS / 1000.0)
+#                 if sleep_needed > 0:
+#                     await asyncio.sleep(sleep_needed)
+
+#                 self._playback_ms_scheduled += chunk_ms
+#                 if self.recorder:
+#                     await self.recorder.add_agent_audio(chunk)
+
+#                 if self.ws.client_state != WebSocketState.CONNECTED:
+#                     logger.info(f"[{self.call_id}] Socket no longer connected, stopping sender.")
+#                     break
+
+#                 if not await self._send_pcm16_media(chunk):
+#                     logger.info(f"[{self.call_id}] Socket closed while sending; stopping sender.")
+#                     break
+
+#                 if getattr(self.bridge, "transfer_requested", False) and not self._transfer_requested:
+#                     self._transfer_requested = True
+#                     self._transfer_reason = getattr(self.bridge, "transfer_reason", "")
+#                     asyncio.create_task(self._maybe_request_warm_transfer())
+
+#                 if (
+#                     self._transfer_requested
+#                     and getattr(self.bridge, "_caller_has_spoken", False)
+#                     and self.bridge.output_queue.empty()
+#                     and self._transfer_notified_at is not None
+#                     and (time.monotonic() - self._transfer_notified_at) >= _TRANSFER_GRACE_PERIOD_SECONDS
+#                 ):
+#                     logger.info(f"[{self.call_id}] Closing socket -- transfer handoff (grace period elapsed).")
+#                     await self._close_socket()
+#                     break
+
+#                 if getattr(self.bridge, "call_should_end", False) and self.bridge.output_queue.empty():
+#                     logger.info(f"[{self.call_id}] Closing socket -- call ending naturally.")
+#                     await self._close_socket()
+#                     break
+
+#         except asyncio.CancelledError:
+#             pass
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Audio sender error: {e}")
+
+#     def _build_insert_enquiry_blocks(self, transcript: str, collected_info) -> list:
+#         """
+#         Assemble the batch of r_type blocks to send to insert_enquiry_service.
+#         (Unchanged -- CRM/business logic, not part of the Bonvoice protocol
+#         or the outbound-context work above.)
+#         """
+
+#         blocks = []
+
+#         if collected_info is None:
+#             logger.info(f"[{self.call_id}] No collected_info on bridge -- skipping insert_enquiry_service.")
+#             return blocks
+
+#         child_name = getattr(collected_info, "child_name", None)
+#         father_name = getattr(collected_info, "father_name", None)
+#         mother_name = getattr(collected_info, "mother_name", None)
+#         dob = getattr(collected_info, "dob", None)
+#         grade = getattr(collected_info, "admission_opted_for", None)
+#         email = getattr(collected_info, "email", None)
+#         mother_mobile = getattr(collected_info, "mother_mobile", None)
+#         raw_callback_time = getattr(collected_info, "callback_time", None)
+#         callback_time = _normalize_datetime(raw_callback_time, self.call_id)
+#         visit_requested = getattr(collected_info, "visit_requested", False)
+#         requests_list = getattr(collected_info, "requests", []) or []
+#         tertiary_list = getattr(collected_info, "tertiary_signals", []) or []
+
+#         branch_name = getattr(collected_info, "branch_name", None)
+#         branch_cfg = schoolknot_api.resolve_branch(branch_name)
+#         self._resolved_api_key = branch_cfg["api_key"] if branch_cfg else None
+#         school_id = branch_cfg["school_id"] if branch_cfg else ""
+
+#         if branch_name and not branch_cfg:
+#             logger.warning(
+#                 f"[{self.call_id}] Caller mentioned branch {branch_name!r} but it "
+#                 f"didn't match any known branch -- using default api_key, no school_id."
+#             )
+
+#         caller_status = self._caller_context.get("caller_status")
+
+#         if caller_status == "existing" and self._enquiry_id:
+
+#             if callback_time:
+#                 blocks.append(schoolknot_api.build_followup_block(
+#                     follow_up_date=callback_time,
+#                     enquiry_id=self._enquiry_id,
+#                 ))
+
+#             if visit_requested:
+#                 blocks.append(schoolknot_api.build_walkin_block(
+#                     schedule_walkin_date=callback_time or "",
+#                     comments="Campus visit requested during AI call.",
+#                     enquiry_id=self._enquiry_id,
+#                 ))
+
+#         elif caller_status == "new":
+
+#             if child_name:
+#                 enquiry_date = datetime.now().strftime("%Y-%m-%d")
+#                 probability = "2" if visit_requested else "1"
+
+#                 blocks.append(schoolknot_api.build_new_enquiry_block(
+#                     child_name=child_name,
+#                     father_name=father_name or "",
+#                     mother_name=mother_name or "",
+#                     mobile=self._caller_number,
+#                     mother_mobile=mother_mobile or "",
+#                     email=email or "",
+#                     dob=dob or "",
+#                     admission_opted_for=grade or "",
+#                     enquiry_date=enquiry_date,
+#                     probability=probability,
+#                     school_id=school_id,
+#                 ))
+
+#                 if callback_time:
+#                     blocks.append(schoolknot_api.build_followup_block(
+#                         follow_up_date=callback_time,
+#                     ))
+
+#                 if visit_requested:
+#                     blocks.append(schoolknot_api.build_walkin_block(
+#                         schedule_walkin_date=callback_time or "",
+#                         comments="Campus visit requested during AI call.",
+#                     ))
+
+#                 if self._pending_transfer_note:
+#                     blocks.append(schoolknot_api.build_other_request_block(
+#                         requested_for=self._pending_transfer_note,
+#                     ))
+
+#             else:
+
+#                 note_parts = []
+#                 if callback_time:
+#                     note_parts.append(f"Callback requested: {callback_time}")
+#                 if visit_requested:
+#                     note_parts.append("Campus visit requested")
+#                 if self._pending_transfer_note:
+#                     note_parts.append(self._pending_transfer_note)
+#                 if father_name or mother_name or self._caller_number:
+#                     who = father_name or mother_name or ""
+#                     note_parts.append(
+#                         f"Caller info (no child name given): {who} "
+#                         f"{self._caller_number}".strip()
+#                     )
+
+#                 if note_parts:
+#                     note = "Incomplete new-caller enquiry -- " + " | ".join(note_parts)
+#                     blocks.append(schoolknot_api.build_other_request_block(
+#                         requested_for=note,
+#                     ))
+#                     logger.info(
+#                         f"[{self.call_id}] No child_name captured -- logging "
+#                         f"partial info as a free-text note instead of an enquiry."
+#                     )
+
+#         if requests_list or tertiary_list:
+#             summary_parts = []
+#             if requests_list:
+#                 summary_parts.append("Requested: " + ", ".join(requests_list))
+#             if tertiary_list:
+#                 summary_parts.append("Insights: " + ", ".join(tertiary_list))
+#             summary_note = " | ".join(summary_parts)
+
+#             if caller_status == "existing" and self._enquiry_id:
+#                 blocks.append(schoolknot_api.build_other_request_block(
+#                     requested_for=summary_note,
+#                     enquiry_id=self._enquiry_id,
+#                 ))
+#             elif caller_status == "new":
+#                 blocks.append(schoolknot_api.build_other_request_block(
+#                     requested_for=summary_note,
+#                 ))
+
+#         if not blocks:
+#             logger.info(
+#                 f"[{self.call_id}] No structured enquiry data captured this call -- "
+#                 f"skipping insert_enquiry_service (nothing new to write back)."
+#             )
+
+#         return blocks
+
+#     async def _cleanup(self):
+#         if self._ringback_task and not self._ringback_task.done():
+#             self._ringback_stop_event.set()
+#             self._ringback_task.cancel()
+#             try:
+#                 await self._ringback_task
+#             except asyncio.CancelledError:
+#                 pass
+#             except Exception as e:
+#                 logger.error(f"[{self.call_id}] Error awaiting ringback task during cleanup: {e}")
+
+#         if self._sender_task:
+#             self._sender_task.cancel()
+#             try:
+#                 await self._sender_task
+#             except asyncio.CancelledError:
+#                 pass
+#             except Exception as e:
+#                 logger.error(f"[{self.call_id}] Error awaiting sender task during cleanup: {e}")
+
+#         if self._silence_watcher_task:
+#             self._silence_watcher_task.cancel()
+#             try:
+#                 await self._silence_watcher_task
+#             except asyncio.CancelledError:
+#                 pass
+#             except Exception as e:
+#                 logger.error(f"[{self.call_id}] Error awaiting silence watcher during cleanup: {e}")
+
+#         if self._hangup_watchdog_task:
+#             self._hangup_watchdog_task.cancel()
+#             try:
+#                 await self._hangup_watchdog_task
+#             except asyncio.CancelledError:
+#                 pass
+#             except Exception as e:
+#                 logger.error(f"[{self.call_id}] Error awaiting hangup watchdog during cleanup: {e}")
+
+#         transcript             = self.bridge.full_transcript() if self.bridge else ""
+#         structured_transcript  = self.bridge.structured_transcript() if self.bridge else []
+#         collected_info         = self.bridge.collected_info    if self.bridge else None
+
+#         logger.info(
+#             f"[{self.call_id}] collected_info dump: "
+#             f"{vars(collected_info) if collected_info else None}"
+#         )
+
+#         if self.bridge:
+#             await self.bridge.stop()
+#         recording_path = None
+#         if self.recorder:
+#             try:
+#                 local_path = self.recorder.save()
+#                 logger.info(f"[{self.call_id}] Recording saved locally: {local_path}")
+#                 try:
+#                     from mongo_recording_store import upload_recording
+#                     upload_recording(self.call_id, local_path)
+#                     recording_path = self.call_id
+#                 except Exception as e:
+#                     logger.error(f"[{self.call_id}] MongoDB upload failed, local copy kept: {e}")
+#                     recording_path = local_path
+#                 else:
+#                     try:
+#                         import os
+#                         os.remove(local_path)
+#                     except Exception:
+#                         pass
+#             except Exception as e:
+#                 logger.error(f"[{self.call_id}] Failed to save recording: {e}")
+#         try:
+#             blocks = self._build_insert_enquiry_blocks(transcript, collected_info)
+#             if blocks:
+#                 result = await schoolknot_api.insert_enquiry_service(
+#                     blocks, api_key=self._resolved_api_key
+#                 )
+#                 logger.info(f"[{self.call_id}] insert_enquiry_service SUCCESS -- response: {result}")
+#             else:
+#                 logger.info(f"[{self.call_id}] insert_enquiry_service SKIPPED -- no blocks to send.")
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Failed to call insert_enquiry_service: {e}")
+
+#         try:
+#             from mongo_call_store import save_call_record
+#             save_call_record(
+#                 call_id=self.call_id,
+#                 caller_number=self._caller_number,
+#                 channel_id=self._channel_id,
+#                 caller_context=self._caller_context,
+#                 enquiry_id=self._enquiry_id,
+#                 transcript=structured_transcript,
+#                 collected_info=collected_info,
+#                 recording_reference=recording_path,
+#                 call_start_time=self._call_start_time,
+#                 transfer_requested=self._transfer_requested,
+#                 transfer_reason=self._transfer_reason,
+#                 prompt_type=self._prompt_type,
+#                 is_outbound=self._is_outbound,
+#             )
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Failed to save call record to MongoDB: {e}")
+
+#         await self._close_socket()
+
+#         if self._on_call_end:
+#             if asyncio.iscoroutinefunction(self._on_call_end):
+#                 await self._on_call_end(self.call_id, transcript, collected_info, recording_path)
+#             else:
+#                 self._on_call_end(self.call_id, transcript, collected_info, recording_path)
 import asyncio
 import base64
 import json
@@ -1478,12 +2652,6 @@ class WsCallHandler:
         grade, branch_name, appointment_type/date/time, enquiry_status,
         call_purpose, notes, enquiry_id -- all optional; only what
         SchoolKnot actually sent on /api/call/initiate will be present).
-
-        This is what makes "the agent talks according to the API
-        parameters" actually happen: prompt_type picks which script/tone
-        to use, and the rest of the context fills in the specifics
-        (which student, which branch, which appointment) so the agent
-        doesn't have to ask the caller things we already know.
         """
         ctx = self._outbound_context
         parent_name    = ctx.get("parent_name") or self._lead_name or "there"
@@ -2067,14 +3235,27 @@ class WsCallHandler:
     def _build_insert_enquiry_blocks(self, transcript: str, collected_info) -> list:
         """
         Assemble the batch of r_type blocks to send to insert_enquiry_service.
-        (Unchanged -- CRM/business logic, not part of the Bonvoice protocol
-        or the outbound-context work above.)
+
+        This follows SchoolKnot's documented r_type payload format exactly
+        (see schoolknot_api.build_new_enquiry_block / build_walkin_block /
+        build_followup_block / build_other_request_block):
+
+            r_type=1  -> new enquiry insert
+            r_type=2  -> schedule a walk-in
+            r_type=3  -> schedule/update a follow-up date
+            r_type=4  -> free-text note against an enquiry
+
+        NOTE: this only builds blocks from data actually captured during
+        the call. If nothing was captured, it returns an empty list --
+        _cleanup() below is responsible for guaranteeing the insert API
+        still fires every time by substituting a fallback r_type=4 note
+        when this returns empty.
         """
 
         blocks = []
 
         if collected_info is None:
-            logger.info(f"[{self.call_id}] No collected_info on bridge -- skipping insert_enquiry_service.")
+            logger.info(f"[{self.call_id}] No collected_info on bridge -- will send fallback note only.")
             return blocks
 
         child_name = getattr(collected_info, "child_name", None)
@@ -2201,10 +3382,44 @@ class WsCallHandler:
         if not blocks:
             logger.info(
                 f"[{self.call_id}] No structured enquiry data captured this call -- "
-                f"skipping insert_enquiry_service (nothing new to write back)."
+                f"_cleanup() will send a fallback note instead."
             )
 
         return blocks
+
+    def _build_fallback_note_block(self, transcript: str) -> dict:
+        """
+        r_type=4 fallback block used when _build_insert_enquiry_blocks()
+        returns nothing to send. Guarantees insert_enquiry_service is
+        always called once per finished call, per SchoolKnot's requested
+        "call ends -> insert API fires" behaviour, even when the caller
+        gave no structured data (hung up early, silent call, wrong
+        number, etc).
+
+        Kept short and uses the SAME r_type=4 shape SchoolKnot already
+        expects (schoolknot_api.build_other_request_block), so the
+        payload format matches what they specified -- this is not a new
+        block type, just the normal free-text note used with a generic
+        message and (when known) the enquiry_id attached.
+        """
+        duration_s = None
+        if self._call_start_time:
+            duration_s = int((datetime.now(timezone.utc) - self._call_start_time).total_seconds())
+
+        note_bits = [f"Call completed ({self._prompt_type})"]
+        if duration_s is not None:
+            note_bits.append(f"duration: {duration_s}s")
+        if not transcript or not transcript.strip():
+            note_bits.append("no speech/transcript captured")
+        else:
+            note_bits.append("no structured data extracted from conversation")
+
+        note = "Auto-log -- " + " | ".join(note_bits)
+
+        return schoolknot_api.build_other_request_block(
+            requested_for=note,
+            enquiry_id=self._enquiry_id,  # omitted automatically if None
+        )
 
     async def _cleanup(self):
         if self._ringback_task and not self._ringback_task.done():
@@ -2275,17 +3490,30 @@ class WsCallHandler:
                         pass
             except Exception as e:
                 logger.error(f"[{self.call_id}] Failed to save recording: {e}")
+
+        # -- SchoolKnot insert -------------------------------------------------
+        # GUARANTEED to fire once per completed call. If real structured
+        # data was captured during the call, that goes out (same r_type
+        # block format SchoolKnot specified). If nothing was captured,
+        # a short r_type=4 fallback note is sent instead of skipping the
+        # call entirely, so SchoolKnot always sees that a call happened.
         try:
             blocks = self._build_insert_enquiry_blocks(transcript, collected_info)
-            if blocks:
-                result = await schoolknot_api.insert_enquiry_service(
-                    blocks, api_key=self._resolved_api_key
+
+            if not blocks:
+                blocks = [self._build_fallback_note_block(transcript)]
+                logger.info(
+                    f"[{self.call_id}] No structured data captured -- "
+                    f"sending fallback note so insert_enquiry_service still fires."
                 )
-                logger.info(f"[{self.call_id}] insert_enquiry_service SUCCESS -- response: {result}")
-            else:
-                logger.info(f"[{self.call_id}] insert_enquiry_service SKIPPED -- no blocks to send.")
+
+            result = await schoolknot_api.insert_enquiry_service(
+                blocks, api_key=self._resolved_api_key
+            )
+            logger.info(f"[{self.call_id}] insert_enquiry_service SUCCESS -- response: {result}")
         except Exception as e:
             logger.error(f"[{self.call_id}] Failed to call insert_enquiry_service: {e}")
+        # ------------------------------------------------------------------
 
         try:
             from mongo_call_store import save_call_record
