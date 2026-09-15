@@ -1,9 +1,8 @@
 """
 outbound_call.py
 
-⭐ This is the API you hand over to SchoolKnot (the client) to trigger
-   outbound calls. ⭐
-
+This is the API you hand over to SchoolKnot (the client) to trigger
+   outbound calls. 
 SchoolKnot calls POST /api/outbound/initiate-call with a phone number +
 lead context + call objective. This file then calls VoiceLink's
 `add_lead` API to place the outbound call. VoiceLink already has your

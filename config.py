@@ -85,30 +85,6 @@ PRODUCT_RESTRICTIONS = os.getenv("PRODUCT_RESTRICTIONS", "")
 # Full override for business context — if set, replaces the auto-generated paragraph
 BUSINESS_CONTEXT     = os.getenv("BUSINESS_CONTEXT",    "")
 
-# Qualify questions — what to ask the lead about (one per line, shown as bullet points)
-# Default is car-sales focused; change for your business domain
-QUALIFY_QUESTIONS    = os.getenv(
-    "QUALIFY_QUESTIONS",
-    "Kaunsi car ya segment mein interest hai? (e.g. SUV, sedan, hatchback, specific model)\n"
-    "Budget range kya hai?\n"
-    "Delivery kahan chahiye?\n"
-    "Kitne time mein lena chahte hain?\n"
-    "Insurance bhi chahiye?"
-)
-
-# Pitch lines — 1-2 lines to pitch your product/service (shown as bullet points)
-PITCH_LINES          = os.getenv(
-    "PITCH_LINES",
-    "Hum {OPERATING_CITY} mein hain, pan-India deliver karte hain — {INDUSTRY_EXPERIENCE} se trusted naam hai.\n"
-    "New purchase ke saath best deals bhi milti hain — sab ek jagah."
-)
-
-# Opening question after intro — what to ask to start the sales conversation
-OPENING_QUESTION     = os.getenv(
-    "OPENING_QUESTION",
-    "Kya aap {BUSINESS_TYPE} ke baare mein soch rahe hain?"
-)
-
 # ── CORS ──────────────────────────────────────────────────────────────────────
 _origins_raw    = os.getenv("ALLOWED_ORIGINS", "*")
 ALLOWED_ORIGINS: list[str] = (

@@ -1,270 +1,3 @@
-# """
-# GeminiBridge -- manages a single Gemini Live API session for one phone call.
-# """
-
-# import asyncio
-# import base64
-# import logging
-# from typing import Optional
-
-# from google import genai
-
-# from audio_utils import upsample_8k_to_16k, downsample_24k_to_8k
-
-# from config import (
-#     GEMINI_API_KEY,
-#     GEMINI_MODEL,
-#     GEMINI_VOICE,
-#     USE_VERTEX_AI,
-#     VERTEX_PROJECT_ID,
-#     VERTEX_LOCATION,
-#     GOOGLE_APPLICATION_CREDENTIALS,
-#     AGENT_NAME,
-#     COMPANY_NAME,
-#     AGENT_LANGUAGE,
-# )
-
-# from prompts import build_system_prompt, PromptType
-
-# from extractor import extract_from_chunk
-# from lead_info import LeadInfo, upsert as upsert_info
-
-# logger = logging.getLogger(__name__)
-
-# _OUTPUT_QUEUE_MAXSIZE = 100
-
-
-# class GeminiBridge:
-#     def __init__(
-#         self,
-#         call_sid: str,
-#         outbound_intro: Optional[str] = None,
-#         prompt_type: "PromptType" = "sales",
-#         org_config: Optional[dict] = None,
-#         # ✅ Keep these for internal DB tracking only — never passed to prompt
-#         lead_id: str = "",
-#         initial_info: Optional[LeadInfo] = None,
-#     ):
-
-#         self.call_sid = call_sid
-#         self.lead_id = lead_id          # internal tracking only
-#         self.outbound_intro = outbound_intro
-#         self.prompt_type = prompt_type
-#         self.org_config = org_config
-
-#         self.collected_info: LeadInfo = (
-#             initial_info or LeadInfo(lead_id=lead_id)
-#         )
-
-#         # Gemini Client
-#         if USE_VERTEX_AI:
-
-#             if GOOGLE_APPLICATION_CREDENTIALS:
-#                 import os
-#                 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
-
-#             self._client = genai.Client(
-#                 vertexai=True,
-#                 project=VERTEX_PROJECT_ID,
-#                 location=VERTEX_LOCATION
-#             )
-
-#             logger.info(f"[{call_sid}] Using Vertex AI")
-
-#         else:
-
-#             self._client = genai.Client(
-#                 api_key=GEMINI_API_KEY,
-#                 http_options={"api_version": "v1beta"},
-#             )
-
-#             logger.info(f"[{call_sid}] Using Gemini API Key")
-
-#         self._session = None
-#         self._task = None
-
-#         self.output_queue: asyncio.Queue[
-#             Optional[bytes]
-#         ] = asyncio.Queue(maxsize=_OUTPUT_QUEUE_MAXSIZE)
-
-#         self._active = False
-#         self.transcript_parts: list[str] = []
-#         self.on_hangup: Optional[asyncio.Event] = asyncio.Event()
-
-#     async def start(self, send_greeting: bool = True):
-
-#         # ✅ Single clean prompt — no lead/test distinction
-#         system_prompt = build_system_prompt(
-#             prompt_type=self.prompt_type,
-#             org_config=self.org_config,
-#         )
-
-#         _types = genai.types
-
-#         config = _types.LiveConnectConfig(
-#             response_modalities=["AUDIO"],
-
-#             system_instruction=_types.Content(
-#                 role="user",
-#                 parts=[_types.Part(text=system_prompt)],
-#             ),
-
-#             speech_config=_types.SpeechConfig(
-#                 voice_config=_types.VoiceConfig(
-#                     prebuilt_voice_config=_types.PrebuiltVoiceConfig(
-#                         voice_name=GEMINI_VOICE
-#                     )
-#                 ),
-#                 language_code=AGENT_LANGUAGE,
-#             ),
-
-#             output_audio_transcription=_types.AudioTranscriptionConfig(),
-#             input_audio_transcription=_types.AudioTranscriptionConfig(),
-#         )
-
-#         self._ctx = self._client.aio.live.connect(
-#             model=GEMINI_MODEL,
-#             config=config,
-#         )
-
-#         self._session = await self._ctx.__aenter__()
-#         self._active = True
-
-#         logger.info(f"[{self.call_sid}] Gemini session opened.")
-
-#         self._task = asyncio.create_task(self._receive_loop())
-
-#         if send_greeting:
-
-#             if self.outbound_intro:
-#                 msg = (
-#                     f'(Start the call. Say exactly and only: '
-#                     f'"{self.outbound_intro}")'
-#                 )
-#             else:
-#                 msg = '(Start the call. Say exactly and only: "Hello.")'
-
-#             await self._session.send_realtime_input(text=msg)
-
-#     async def stop(self):
-
-#         self._active = False
-
-#         try:
-#             self.output_queue.put_nowait(None)
-#         except asyncio.QueueFull:
-#             pass
-
-#         if self._task:
-#             self._task.cancel()
-#             try:
-#                 await self._task
-#             except asyncio.CancelledError:
-#                 pass
-
-#         if self._session:
-#             try:
-#                 await self._ctx.__aexit__(None, None, None)
-#             except Exception:
-#                 pass
-
-#         logger.info(f"[{self.call_sid}] Gemini session closed.")
-
-#     async def send_audio(self, pcm_8k: bytes):
-
-#         if not self._active or not self._session:
-#             return
-
-#         pcm_16k = await upsample_8k_to_16k(pcm_8k)
-
-#         await self._session.send_realtime_input(
-#             audio=genai.types.Blob(
-#                 data=pcm_16k,
-#                 mime_type="audio/pcm;rate=16000"
-#             )
-#         )
-
-#     async def _receive_loop(self):
-
-#         try:
-
-#             while self._active:
-
-#                 turn = self._session.receive()
-
-#                 async for response in turn:
-
-#                     if not self._active:
-#                         break
-
-#                     if response.data:
-
-#                         raw_pcm = response.data
-
-#                         if isinstance(raw_pcm, str):
-#                             raw_pcm = base64.b64decode(raw_pcm)
-
-#                         pcm_8k = await downsample_24k_to_8k(bytes(raw_pcm))
-
-#                         try:
-#                             self.output_queue.put_nowait(pcm_8k)
-#                         except asyncio.QueueFull:
-#                             logger.warning("Audio queue full")
-
-#                     if response.text:
-
-#                         text = response.text
-#                         logger.info(f"[{self.call_sid}] Agent: {text}")
-#                         self.transcript_parts.append(f"{AGENT_NAME}: {text}")
-
-#                         # ✅ Extract & save info internally (no prompt leakage)
-#                         chunk_info = await extract_from_chunk(text)
-#                         if chunk_info:
-#                             self._merge_info(chunk_info)
-#                             upsert_info(self.collected_info)
-
-#         except asyncio.CancelledError:
-#             pass
-
-#         except Exception as e:
-#             logger.error(
-#                 f"[{self.call_sid}] Gemini receive error: {e}",
-#                 exc_info=True
-#             )
-
-#         finally:
-#             try:
-#                 self.output_queue.put_nowait(None)
-#             except asyncio.QueueFull:
-#                 pass
-
-#     def full_transcript(self) -> str:
-#         return " ".join(self.transcript_parts)
-
-#     def _merge_info(self, chunk: LeadInfo):
-
-#         info = self.collected_info
-
-#         if chunk.budget_min is not None:
-#             info.budget_min = chunk.budget_min
-#         if chunk.budget_max is not None:
-#             info.budget_max = chunk.budget_max
-#         if chunk.location is not None:
-#             info.location = chunk.location
-#         if chunk.timeline is not None:
-#             info.timeline = chunk.timeline
-#         if chunk.property_type is not None:
-#             info.property_type = chunk.property_type
-#         if chunk.bhk is not None:
-#             info.bhk = chunk.bhk
-#         if chunk.team_size is not None:
-#             info.team_size = chunk.team_size
-#         if chunk.current_crm is not None:
-#             info.current_crm = chunk.current_crm
-#         if chunk.callback_time is not None:
-#             info.callback_time = chunk.callback_time
-#         if chunk.demo_requested:
-#             info.demo_requested = True
 """
 GeminiBridge -- manages a single Gemini Live API session for one phone call.
 """
@@ -664,34 +397,48 @@ class GeminiBridge:
 
         speech_config = _types.SpeechConfig(**speech_config_kwargs)
 
-        config = _types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-
-            tools=[end_call_tool],
-
-            system_instruction=_types.Content(
+        config_kwargs = {
+            "response_modalities": ["AUDIO"],
+            "tools": [end_call_tool],
+            "system_instruction": _types.Content(
                 role="user",
                 parts=[_types.Part(text=system_prompt)],
             ),
+            "speech_config": speech_config,
+            "output_audio_transcription": _types.AudioTranscriptionConfig(),
+            "input_audio_transcription": _types.AudioTranscriptionConfig(),
+        }
 
-            speech_config=speech_config,
-
-            output_audio_transcription=_types.AudioTranscriptionConfig(),
-            input_audio_transcription=_types.AudioTranscriptionConfig(),
-
-            # Explicitly enable automatic VAD-based interruption
-            # detection on Gemini's side. This is what makes Gemini emit
-            # server_content.interrupted when the caller barges in while
-            # the agent is still speaking. Some SDK versions default this
-            # to on already, but setting it explicitly avoids silently
-            # losing barge-in detection if a library upgrade changes the
-            # default.
-            realtime_input_config=_types.RealtimeInputConfig(
+        # FIX: same story as SpeechConfig.language_code above — older
+        # installed google-genai versions don't have a RealtimeInputConfig
+        # (or AutomaticActivityDetection) class in google.genai.types AT
+        # ALL, so referencing _types.RealtimeInputConfig unconditionally
+        # raises AttributeError and crashes bridge.start() before the
+        # session ever opens:
+        #   AttributeError: module 'google.genai.types' has no attribute
+        #   'RealtimeInputConfig'
+        #
+        # The real fix is upgrading google-genai (`pip install --upgrade
+        # google-genai`) — automatic VAD / barge-in detection is enabled
+        # server-side by default on essentially every version, so omitting
+        # this explicit config on an old SDK does not disable barge-in,
+        # it just means we're relying on the server default instead of
+        # stating it explicitly.
+        if hasattr(_types, "RealtimeInputConfig") and hasattr(_types, "AutomaticActivityDetection"):
+            config_kwargs["realtime_input_config"] = _types.RealtimeInputConfig(
                 automatic_activity_detection=_types.AutomaticActivityDetection(
                     disabled=False,
                 ),
-            ),
-        )
+            )
+        else:
+            logger.warning(
+                f"[{self.call_sid}] Installed google-genai has no "
+                f"RealtimeInputConfig/AutomaticActivityDetection — skipping "
+                f"explicit VAD config (server-side default VAD still "
+                f"applies). Run `pip install --upgrade google-genai` to fix."
+            )
+
+        config = _types.LiveConnectConfig(**config_kwargs)
 
         self._ctx = self._client.aio.live.connect(
             model=GEMINI_MODEL,
