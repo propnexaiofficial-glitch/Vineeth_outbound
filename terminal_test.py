@@ -31,6 +31,10 @@ MIC_FRAMES     = MIC_RATE * MIC_CHUNK_MS // 1000   # 320 frames
 OUT_BLOCK_MS   = 20
 OUT_FRAMES     = OUT_RATE * OUT_BLOCK_MS // 1000   # 480 frames
 
+# Software echo cancellation: how many ms after the agent STOPS playing
+# before the mic is re-opened. Increase if you still hear echo on your setup.
+MIC_REOPEN_DELAY_MS = 300
+
 # ANSI colours
 _CYAN   = "\033[96m"
 _GREEN  = "\033[92m"
@@ -163,6 +167,13 @@ class TerminalBridge(GeminiBridge):
         self.raw_24k_deque: deque[bytes] = deque()
         # Threading event — checked by audio callback every 20 ms block
         self.muted_event = threading.Event()
+        # Set while agent audio chunks are arriving; cleared when the deque
+        # drains. mic_sender uses this to suppress echo during playback.
+        self.agent_speaking = threading.Event()
+        # Timestamp (monotonic) of when the last agent audio chunk arrived.
+        # mic_sender won't forward mic audio until MIC_REOPEN_DELAY_MS after
+        # this timestamp, giving the speakers time to go quiet.
+        self._last_agent_audio_ts: float = 0.0
         # Recorder — injected by run_session after construction
         self.recorder: Optional[Recorder] = None
 
@@ -210,6 +221,9 @@ class TerminalBridge(GeminiBridge):
                             raw = base64.b64decode(raw)
                         raw_bytes = bytes(raw)
                         self.raw_24k_deque.append(raw_bytes)
+                        # Mark agent as speaking + record timestamp for echo gating
+                        self.agent_speaking.set()
+                        self._last_agent_audio_ts = asyncio.get_event_loop().time()
                         # Feed recorder (resamples 24k→16k internally)
                         if self.recorder:
                             self.recorder.add_agent(raw_bytes)
@@ -272,6 +286,7 @@ def make_output_callback(bridge: TerminalBridge):
     Checks bridge.muted_event on every 20 ms block — if set, outputs silence
     immediately so barge-in stops playback within one block (<20 ms).
     Uses a leftover buffer so partial chunks carry over between callbacks.
+    Clears bridge.agent_speaking when the deque drains (playback finished).
     """
     leftover = bytearray()
 
@@ -295,6 +310,10 @@ def make_output_callback(bridge: TerminalBridge):
         else:
             chunk = bytes(leftover) + bytes(needed - len(leftover))
             leftover.clear()
+
+        # If deque is now empty and leftover is empty, playback has finished
+        if not bridge.raw_24k_deque and not leftover:
+            bridge.agent_speaking.clear()
 
         arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
         outdata[:, 0] = arr
@@ -420,6 +439,7 @@ async def run_session(prompt_type: PromptType, lead_name: str, send_greeting: bo
 
     # ── Mic sender task ───────────────────────────────────────────────────────
     async def mic_sender():
+        import time as _time
         while not stop_event.is_set():
             try:
                 chunk = await asyncio.wait_for(mic_queue.get(), timeout=0.1)
@@ -427,6 +447,19 @@ async def run_session(prompt_type: PromptType, lead_name: str, send_greeting: bo
                 continue
             if chunk is None:
                 break
+
+            # ── Software echo gate ────────────────────────────────────────
+            # While the agent is playing audio through the speakers, the mic
+            # picks up that same audio and sends it back to Gemini — this
+            # triggers false barge-ins that cut the AI off mid-sentence.
+            # Solution: drop mic chunks while agent_speaking is set AND for
+            # MIC_REOPEN_DELAY_MS after the last audio chunk, giving the
+            # room acoustics time to settle before we listen again.
+            now = asyncio.get_event_loop().time()
+            silence_until = bridge._last_agent_audio_ts + MIC_REOPEN_DELAY_MS / 1000.0
+            if bridge.agent_speaking.is_set() or now < silence_until:
+                continue   # drop this mic chunk — it's echo from our speakers
+
             await bridge.send_audio_16k(chunk)
 
     mic_task = asyncio.create_task(mic_sender())
@@ -511,12 +544,12 @@ AVAILABLE_VOICES = [
 _CLIENT_CONFIGS: dict[str, dict] = {
 
     "pinpro": {
-        "agent_name":   "Anaya",
+        "agent_name":   "Riya",
         "company_name": "Ayurveda wellness",
         "voice":        "Aoede",
         "rate":         0.92,
         # Custom greeting sent to Gemini to kick off the call
-        "greeting": "Hi! I'm Anaya calling on behalf of PINPRO. Am I talking to Mr. Baba?",
+        "greeting": "Hi! I'm Riya calling on behalf of PINPRO. Am I talking to Mr. Baba?",
         # Full business context injected into the prompt
         "business_context": """
 ## PINPRO ke baare mein
@@ -663,14 +696,17 @@ Always use "you" and "your" — polite and professional.
 {personality}
 {structure}
 {hard_rules}
-{info_section}""".replace("GrabYourCar", company_name).replace("Anaya", agent_name).replace("grabyourcar.com", "pinpropms.com").replace("Anshdeep sir", "Mr. Baba").replace("Anshdeep@", "info@")
+{info_section}""".replace("GrabYourCar", company_name).replace("Riya", agent_name).replace("grabyourcar.com", "pinpropms.com").replace("Anshdeep sir", "Mr. Baba").replace("Anshdeep@", "info@")
 
     return cfg, custom_build_prompt, greeting_line
 
 def main():
     parser = argparse.ArgumentParser(description="Terminal speech-to-speech tester")
-    parser.add_argument("--prompt", "-p", default="sales",
-        choices=["sales","feedback","insurance_only","followup","objection","callback"])
+    parser.add_argument("--prompt", "-p", default="outbound_new_lead",
+        choices=["outbound_new_lead","outbound_follow_up","outbound_campus_visit_followup",
+                 "outbound_admission_reminder","outbound_event_invite","outbound_reengagement",
+                 "outbound_reconfirmation","faq","callback","objection",
+                 "transfer_to_human","angry_caller"])
     parser.add_argument("--name", "-n", default="Test User")
     parser.add_argument("--no-greeting", action="store_true")
     parser.add_argument("--voice", "-v", default=None,

@@ -67,11 +67,11 @@ SERVER_WORKERS = int(os.getenv("SERVER_WORKERS", "1"))
 PUBLIC_URL     = os.getenv("PUBLIC_URL", "http://localhost:8000")
 
 # ── Agent persona ─────────────────────────────────────────────────────────────
-AGENT_NAME           = os.getenv("AGENT_NAME",    "Anaya")
-COMPANY_NAME         = os.getenv("COMPANY_NAME",  "Solatire Global School")
-PRODUCT_NAME         = os.getenv("PRODUCT_NAME",  "Solatire Global School")
+AGENT_NAME           = os.getenv("AGENT_NAME",    "Riya")
+COMPANY_NAME         = os.getenv("COMPANY_NAME",  "Schoolknot international School")
+PRODUCT_NAME         = os.getenv("PRODUCT_NAME",  "Schoolknot international School")
 AGENT_LANGUAGE       = os.getenv("AGENT_LANGUAGE", "en-IN")
-GEMINI_VOICE         = os.getenv("GEMINI_VOICE",  "Sadachbia")
+GEMINI_VOICE         = os.getenv("GEMINI_VOICE",  "Leda")
 GEMINI_SPEAKING_RATE = float(os.getenv("GEMINI_SPEAKING_RATE", "1.0"))
 
 # ── Business details (per-client configurable) ────────────────────────────────
