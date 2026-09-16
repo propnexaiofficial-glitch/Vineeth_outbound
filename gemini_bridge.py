@@ -1965,7 +1965,9 @@ class GeminiBridge:
 
         except Exception as e:
             logger.error(
-                f"[{self.call_sid}] Gemini receive error: {e}",
+                f"[{self.call_sid}] *** GEMINI RECEIVE LOOP DIED *** {type(e).__name__}: {e} "
+                f"-- this is why the call goes silent. Check API quota / concurrent "
+                f"session limits / network.",
                 exc_info=True
             )
 

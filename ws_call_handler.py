@@ -1861,8 +1861,9 @@ class WsCallHandler:
         self._sender_task = asyncio.create_task(self._audio_sender())
         self._silence_watcher_task = asyncio.create_task(self._silence_watcher())
         self._hangup_watchdog_task = asyncio.create_task(self._hangup_watchdog())
+        asyncio.create_task(self._first_audio_watchdog())
 
-        logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog tasks created.")
+        logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog + first-audio watchdog tasks created.")
 
     async def _close_socket(self):
         """Bonvoice's spec defines no client-to-platform 'stop'/end-call
