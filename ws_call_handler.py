@@ -1925,6 +1925,24 @@ class WsCallHandler:
         except Exception as e:
             logger.error(f"[{self.call_id}] Hangup watchdog error: {e}")
 
+    async def _first_audio_watchdog(self, timeout_seconds: float = 6.0):
+        """Agar trigger bhejne ke baad itne seconds tak Gemini se koi audio
+        nahi aata, to loudly log karo aur ek retry nudge bhejo."""
+        await asyncio.sleep(timeout_seconds)
+        if self._real_audio_started:
+            return
+        logger.error(
+            f"[{self.call_id}] *** NO AUDIO from Gemini {timeout_seconds:.0f}s after "
+            f"trigger sent *** -- likely a dropped Gemini Live session. Retrying once."
+        )
+        try:
+            if self.bridge and self.bridge._session:
+                await self.bridge._session.send_realtime_input(
+                    text="(The caller is waiting. Begin speaking now.)"
+                )
+        except Exception as e:
+            logger.error(f"[{self.call_id}] Retry nudge also failed: {e}")
+
     async def _silence_watcher(self):
 
         if not self.bridge:
