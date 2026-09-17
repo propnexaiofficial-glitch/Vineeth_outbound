@@ -141,6 +141,21 @@
 #         self._outgoing_leftover  = b""
 #         self._outgoing_packet_id = 0
 
+#         # FIX (audio-packet reliability): multiple independent tasks --
+#         # _ringback_sender, _audio_sender, _maybe_request_warm_transfer
+#         # (fired via asyncio.create_task), and anything that calls
+#         # _close_socket() -- can all try to call self.ws.send_text() /
+#         # self.ws.close() concurrently. Starlette/uvicorn's ASGI `send`
+#         # callable is NOT safe to call concurrently from multiple tasks:
+#         # overlapping awaits on the same connection can interleave
+#         # frames (corrupted/garbled audio on the wire), raise spurious
+#         # RuntimeErrors that get silently swallowed by the broad
+#         # except-clauses below (so a frame just vanishes with no visible
+#         # error), or leave the connection in a bad state. This lock
+#         # serializes every outgoing write on this connection so only one
+#         # coroutine is ever inside ws.send_text()/ws.close() at a time.
+#         self._ws_send_lock       = asyncio.Lock()
+
 #         # Ringback tone (see _ringback_sender): plays from the moment the
 #         # call connects until the agent's first real audio chunk is ready,
 #         # so the caller hears normal ringing instead of silence during
@@ -216,7 +231,7 @@
 #         bytes). Returns False if the socket is closed.
 #         """
 #         try:
-#             await self.ws.send_text(json.dumps({
+#             payload = json.dumps({
 #                 "event": "media",
 #                 "stream_id": self._stream_id,
 #                 "media": {
@@ -224,7 +239,9 @@
 #                     "timestamp": int(time.time() * 1000),
 #                     "payload": base64.b64encode(pcm16_frame).decode("ascii"),
 #                 },
-#             }))
+#             })
+#             async with self._ws_send_lock:
+#                 await self.ws.send_text(payload)
 #             return True
 #         except (WebSocketDisconnect, RuntimeError) as e:
 #             logger.info(f"[{self.call_id}] Socket closed while sending media ({e}).")
@@ -616,16 +633,18 @@
 #         self._sender_task = asyncio.create_task(self._audio_sender())
 #         self._silence_watcher_task = asyncio.create_task(self._silence_watcher())
 #         self._hangup_watchdog_task = asyncio.create_task(self._hangup_watchdog())
+#         asyncio.create_task(self._first_audio_watchdog())
 
-#         logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog tasks created.")
+#         logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog + first-audio watchdog tasks created.")
 
 #     async def _close_socket(self):
 #         """Bonvoice's spec defines no client-to-platform 'stop'/end-call
 #         event -- ending the call is just: close this WebSocket connection.
 #         """
 #         try:
-#             if self.ws.client_state == WebSocketState.CONNECTED:
-#                 await self.ws.close()
+#             async with self._ws_send_lock:
+#                 if self.ws.client_state == WebSocketState.CONNECTED:
+#                     await self.ws.close()
 #         except Exception:
 #             pass
 
@@ -677,6 +696,24 @@
 #             pass
 #         except Exception as e:
 #             logger.error(f"[{self.call_id}] Hangup watchdog error: {e}")
+
+#     async def _first_audio_watchdog(self, timeout_seconds: float = 6.0):
+#         """Agar trigger bhejne ke baad itne seconds tak Gemini se koi audio
+#         nahi aata, to loudly log karo aur ek retry nudge bhejo."""
+#         await asyncio.sleep(timeout_seconds)
+#         if self._real_audio_started:
+#             return
+#         logger.error(
+#             f"[{self.call_id}] *** NO AUDIO from Gemini {timeout_seconds:.0f}s after "
+#             f"trigger sent *** -- likely a dropped Gemini Live session. Retrying once."
+#         )
+#         try:
+#             if self.bridge and self.bridge._session:
+#                 await self.bridge._session.send_realtime_input(
+#                     text="(The caller is waiting. Begin speaking now.)"
+#                 )
+#         except Exception as e:
+#             logger.error(f"[{self.call_id}] Retry nudge also failed: {e}")
 
 #     async def _silence_watcher(self):
 
@@ -732,7 +769,8 @@
 #             "transferTo": target,
 #         }
 #         try:
-#             await self.ws.send_text(json.dumps(payload))
+#             async with self._ws_send_lock:
+#                 await self.ws.send_text(json.dumps(payload))
 #             self._transfer_event_sent = True
 #             logger.info(f"[{self.call_id}] Sent 'transfer' event to Bonvoice -- payload={payload}")
 #         except (WebSocketDisconnect, RuntimeError) as e:
@@ -750,13 +788,14 @@
 #         note = f"Live transfer requested -- reason: {reason}"
 
 #         try:
-#             await self.ws.send_text(json.dumps({
-#                 "event": "transfer_requested",
-#                 "call_id": self.call_id,
-#                 "reason": reason,
-#                 "staff_number": staff_number,
-#                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-#             }))
+#             async with self._ws_send_lock:
+#                 await self.ws.send_text(json.dumps({
+#                     "event": "transfer_requested",
+#                     "call_id": self.call_id,
+#                     "reason": reason,
+#                     "staff_number": staff_number,
+#                     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+#                 }))
 #             self._transfer_notified_at = time.monotonic()
 #             logger.info(
 #                 f"[{self.call_id}] transfer_requested sent over WebSocket -> "
@@ -789,10 +828,11 @@
 #     async def _send_clear_event(self):
 #         self._clear_generation += 1
 #         try:
-#             await self.ws.send_text(json.dumps({
-#                 "event": _CLEAR_EVENT_NAME,
-#                 "stream_id": self._stream_id,
-#             }))
+#             async with self._ws_send_lock:
+#                 await self.ws.send_text(json.dumps({
+#                     "event": _CLEAR_EVENT_NAME,
+#                     "stream_id": self._stream_id,
+#                 }))
 #             logger.info(
 #                 f"[{self.call_id}] Sent '{_CLEAR_EVENT_NAME}' event to "
 #                 f"Bonvoice -- caller interruption (generation {self._clear_generation})."
@@ -1249,6 +1289,25 @@ logger = logging.getLogger(__name__)
 _SILENCE_TIMEOUT_SECONDS = 15
 _SILENCE_CHECK_INTERVAL_SECONDS = 2
 
+# --- Mid-call Gemini-session health watchdog ---------------------------
+# Some gemini-3.1-flash-live-preview failure modes leave the WebSocket
+# to Gemini technically "open" but producing nothing at all -- no audio,
+# no transcription events, no tool calls -- forever. That doesn't raise
+# an exception in gemini_bridge._receive_one_session(), so the bridge's
+# own exception-triggered reconnect never fires. This watchdog catches
+# THAT case from the outside: if literally nothing has come back from
+# Gemini in _MID_CALL_EVENT_GAP_SECONDS, we assume the session is dead
+# and force a reconnect proactively.
+#
+# NOTE: this checks "seconds since ANY event" (audio, transcription, tool
+# call), not "seconds since audio", specifically so it does NOT false-fire
+# during a long stretch where the agent is legitimately just listening to
+# the caller talk -- transcription events keep arriving during that, so
+# the event clock keeps resetting. Only a truly stalled session goes this
+# long with zero events of any kind.
+_MID_CALL_EVENT_GAP_SECONDS = 15.0
+_MID_CALL_WATCHDOG_CHECK_INTERVAL_SECONDS = 3.0
+
 # Bonvoice "Inbound Media Streams v3" spec: audio is ALWAYS raw PCM,
 # 16-bit signed, 8000 Hz, mono -- both directions -- in exact 320-byte
 # (20ms) frames. No a-law / mu-law / linear8 negotiation exists on this
@@ -1319,6 +1378,7 @@ class WsCallHandler:
         self.recorder: Optional[CallRecorder] = None
         self._sender_task        = None
         self._silence_watcher_task = None
+        self._mid_call_watchdog_task = None
         self._on_call_end        = on_call_end
         self._lead_id            = lead_id
         self._initial_info       = initial_info
@@ -1329,13 +1389,6 @@ class WsCallHandler:
         self._is_outbound        = is_outbound
         self._outbound_intro     = outbound_intro
 
-        # Full lead/appointment context handed to us from the
-        # /api/call/initiate request (via main.py's CALL_CONTEXT_STORE
-        # lookup) -- e.g. student_name, grade, branch_name,
-        # appointment_type/date/time, enquiry_status, call_purpose,
-        # notes, enquiry_id. Used by _build_outbound_trigger() below to
-        # make the agent's opening line specific to this call instead of
-        # a generic "Hi, this is X calling" for every prompt_type.
         self._outbound_context   = outbound_context or {}
 
         self._started            = False
@@ -1355,54 +1408,20 @@ class WsCallHandler:
         self._playback_ms_scheduled = 0.0
         self._resolved_api_key: Optional[str] = None
 
-        # Bonvoice identifies a call's media stream by "stream_id" (sent
-        # to us on the 'start' event). Every outgoing 'media'/'clear'
-        # event we send back MUST carry this exact stream_id -- it is NOT
-        # the same thing as call_id, and Bonvoice's platform will not
-        # know which stream a message belongs to without it.
         self._stream_id          = ""
 
-        # Bonvoice requires every outgoing audio frame to be EXACTLY (a
-        # multiple of) 320 bytes. Whatever comes out of Gemini's output
-        # queue won't naturally be aligned to that, so we buffer any
-        # leftover partial frame here and prepend it to the next chunk.
         self._outgoing_leftover  = b""
         self._outgoing_packet_id = 0
 
-        # FIX (audio-packet reliability): multiple independent tasks --
-        # _ringback_sender, _audio_sender, _maybe_request_warm_transfer
-        # (fired via asyncio.create_task), and anything that calls
-        # _close_socket() -- can all try to call self.ws.send_text() /
-        # self.ws.close() concurrently. Starlette/uvicorn's ASGI `send`
-        # callable is NOT safe to call concurrently from multiple tasks:
-        # overlapping awaits on the same connection can interleave
-        # frames (corrupted/garbled audio on the wire), raise spurious
-        # RuntimeErrors that get silently swallowed by the broad
-        # except-clauses below (so a frame just vanishes with no visible
-        # error), or leave the connection in a bad state. This lock
-        # serializes every outgoing write on this connection so only one
-        # coroutine is ever inside ws.send_text()/ws.close() at a time.
         self._ws_send_lock       = asyncio.Lock()
 
-        # Ringback tone (see _ringback_sender): plays from the moment the
-        # call connects until the agent's first real audio chunk is ready,
-        # so the caller hears normal ringing instead of silence during
-        # CRM lookup / LLM session setup.
         self._ringback_task = None
         self._ringback_stop_event = asyncio.Event()
         self._real_audio_started = False
 
-        # Tracks when call_should_end first flipped True, so the hangup
-        # watchdog can give _audio_sender a grace window to finish
-        # streaming the agent's closing line before forcing the socket
-        # closed (see _hangup_watchdog / _HANGUP_WATCHDOG_GRACE_SECONDS).
         self._call_should_end_seen_at: Optional[float] = None
 
     def _generate_ringback_chunk_pcm16(self, elapsed_ms: float, chunk_ms: int = _RINGBACK_CHUNK_MS) -> bytes:
-        """Generate one chunk of standard dual-frequency ringback tone as
-        PCM16 mono samples at _CALL_SAMPLE_RATE, gated on/off per the
-        _RINGBACK_ON_MS / _RINGBACK_OFF_MS cadence.
-        """
         cycle_ms = _RINGBACK_ON_MS + _RINGBACK_OFF_MS
         position_in_cycle = elapsed_ms % cycle_ms
         is_tone_on = position_in_cycle < _RINGBACK_ON_MS
@@ -1427,8 +1446,6 @@ class WsCallHandler:
         return bytes(samples)
 
     async def _ringback_sender(self):
-        """Streams standard ringback tone to the caller from call-connect
-        time until the real agent audio is ready."""
         elapsed_ms = 0.0
         try:
             while not self._ringback_stop_event.is_set():
@@ -1454,10 +1471,6 @@ class WsCallHandler:
         return self._outgoing_packet_id
 
     async def _send_media_frame(self, pcm16_frame: bytes) -> bool:
-        """Send exactly one Bonvoice 'media' event. `pcm16_frame` must
-        already be sized to a multiple of _BONVOICE_CHUNK_BYTES (320
-        bytes). Returns False if the socket is closed.
-        """
         try:
             payload = json.dumps({
                 "event": "media",
@@ -1479,10 +1492,6 @@ class WsCallHandler:
             return False
 
     async def _send_pcm16_media(self, pcm16_bytes: bytes) -> bool:
-        """Buffer + split arbitrary-length PCM16 audio into Bonvoice's
-        required 320-byte (20ms @ 8kHz/16-bit/mono) frames and send each
-        as its own 'media' event.
-        """
         data = self._outgoing_leftover + pcm16_bytes
         n_full_frames = len(data) // _BONVOICE_CHUNK_BYTES
 
@@ -1574,14 +1583,6 @@ class WsCallHandler:
     # -- Outbound greeting/trigger construction ------------------------
 
     def _build_outbound_trigger(self) -> str:
-        """
-        Builds the instruction sent to Gemini to kick off an outbound
-        call, tailored to self._prompt_type using whatever fields are
-        present in self._outbound_context (parent_name, student_name,
-        grade, branch_name, appointment_type/date/time, enquiry_status,
-        call_purpose, notes, enquiry_id -- all optional; only what
-        SchoolKnot actually sent on /api/call/initiate will be present).
-        """
         ctx = self._outbound_context
         parent_name    = ctx.get("parent_name") or self._lead_name or "there"
         student_name   = ctx.get("student_name")
@@ -1678,7 +1679,7 @@ class WsCallHandler:
                 f"interested or have questions. Begin immediately."
             )
 
-        else:  # outbound_new_lead, or any unrecognized prompt_type -- safe generic default
+        else:
             instruction = (
                 f"IMPORTANT: This is an OUTBOUND call to a new lead, {parent_name}"
                 + (f", regarding {student_name}" if student_name else "") + ". "
@@ -1693,8 +1694,6 @@ class WsCallHandler:
         if self._started:
             return
 
-        # Bonvoice shape: {"event":"start","data":{"stream_id":...,
-        # "call_id":...,"from":...,"to":...}}
         start_data = msg.get("data", {}) or {}
 
         self._stream_id = start_data.get("stream_id") or msg.get("stream_id") or ""
@@ -1746,8 +1745,6 @@ class WsCallHandler:
 
         self._call_start_time = datetime.now(timezone.utc)
 
-        # -- Outbound calls: skip the CRM lookup, we already have the
-        # context SchoolKnot gave us at /api/call/initiate time --------
         if self._is_outbound and self._outbound_context:
             enquiry_id_from_context = self._outbound_context.get("enquiry_id")
             self._enquiry_id = enquiry_id_from_context
@@ -1826,7 +1823,6 @@ class WsCallHandler:
             logger.exception(f"[{self.call_id}] bridge.start() FAILED: {type(e).__name__}: {e}")
             raise
 
-        # -- Build the trigger message that kicks off the conversation --
         if self._is_outbound:
             trigger = self._build_outbound_trigger()
         else:
@@ -1861,14 +1857,16 @@ class WsCallHandler:
         self._sender_task = asyncio.create_task(self._audio_sender())
         self._silence_watcher_task = asyncio.create_task(self._silence_watcher())
         self._hangup_watchdog_task = asyncio.create_task(self._hangup_watchdog())
+        self._mid_call_watchdog_task = asyncio.create_task(self._mid_call_audio_watchdog())
         asyncio.create_task(self._first_audio_watchdog())
 
-        logger.info(f"[{self.call_id}] Audio sender + silence watcher + hangup watchdog + first-audio watchdog tasks created.")
+        logger.info(
+            f"[{self.call_id}] Audio sender + silence watcher + hangup "
+            f"watchdog + first-audio watchdog + mid-call session-health "
+            f"watchdog tasks created."
+        )
 
     async def _close_socket(self):
-        """Bonvoice's spec defines no client-to-platform 'stop'/end-call
-        event -- ending the call is just: close this WebSocket connection.
-        """
         try:
             async with self._ws_send_lock:
                 if self.ws.client_state == WebSocketState.CONNECTED:
@@ -1877,10 +1875,6 @@ class WsCallHandler:
             pass
 
     async def _hangup_watchdog(self):
-        """
-        Safety-net fallback only. The PRIMARY, correct way a normal call
-        ends is via _audio_sender.
-        """
         if not self.bridge:
             return
         try:
@@ -1926,8 +1920,6 @@ class WsCallHandler:
             logger.error(f"[{self.call_id}] Hangup watchdog error: {e}")
 
     async def _first_audio_watchdog(self, timeout_seconds: float = 6.0):
-        """Agar trigger bhejne ke baad itne seconds tak Gemini se koi audio
-        nahi aata, to loudly log karo aur ek retry nudge bhejo."""
         await asyncio.sleep(timeout_seconds)
         if self._real_audio_started:
             return
@@ -1943,8 +1935,67 @@ class WsCallHandler:
         except Exception as e:
             logger.error(f"[{self.call_id}] Retry nudge also failed: {e}")
 
-    async def _silence_watcher(self):
+    async def _mid_call_audio_watchdog(self):
+        """
+        Detects a Gemini Live session that has gone completely silent
+        mid-call -- no audio, no transcription, no tool calls, nothing --
+        WITHOUT the underlying receive loop ever raising an exception.
+        Several of the reported gemini-3.1-flash-live-preview bugs look
+        exactly like this (connection stays technically "open" but stops
+        producing anything), so gemini_bridge's own exception-triggered
+        reconnect never gets a chance to run on its own.
 
+        This forces a reconnect proactively via bridge.force_reconnect()
+        once the gap since the LAST EVENT of any kind exceeds the
+        threshold. It deliberately does NOT key off "seconds since audio"
+        alone, so it won't misfire during a stretch where the agent is
+        correctly just listening to the caller talk (transcription events
+        keep the event clock ticking during that).
+        """
+        if not self.bridge:
+            return
+        try:
+            while True:
+                await asyncio.sleep(_MID_CALL_WATCHDOG_CHECK_INTERVAL_SECONDS)
+
+                if self.ws.client_state != WebSocketState.CONNECTED:
+                    break
+                if getattr(self.bridge, "call_should_end", False):
+                    break
+                if not self._real_audio_started:
+                    # First-audio watchdog owns the "before greeting"
+                    # window; don't double-fire here.
+                    continue
+                if getattr(self.bridge, "session_permanently_lost", False):
+                    logger.error(
+                        f"[{self.call_id}] Gemini session permanently lost "
+                        f"(reconnect attempts exhausted) -- ending call."
+                    )
+                    await self._close_socket()
+                    break
+
+                gap = self.bridge.seconds_since_last_event()
+                if gap >= _MID_CALL_EVENT_GAP_SECONDS:
+                    logger.error(
+                        f"[{self.call_id}] *** No events from Gemini for "
+                        f"{gap:.1f}s mid-call *** -- session looks dead. "
+                        f"Forcing reconnect."
+                    )
+                    ok = await self.bridge.force_reconnect(reason="mid_call_watchdog")
+                    if not ok:
+                        logger.error(
+                            f"[{self.call_id}] Forced reconnect failed/"
+                            f"exhausted -- ending call."
+                        )
+                        await self._close_socket()
+                        break
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[{self.call_id}] Mid-call audio watchdog error: {e}")
+
+    async def _silence_watcher(self):
         if not self.bridge:
             return
         try:
@@ -1991,7 +2042,6 @@ class WsCallHandler:
             )
             return
 
-        # Bonvoice shape: {"event":"transfer","transferTo":"{phone_number}"}
         payload = {
             "event": "transfer",
             "transferTo": target,
@@ -2071,7 +2121,6 @@ class WsCallHandler:
             logger.error(f"[{self.call_id}] Failed to send clear event: {e}")
 
     async def _audio_sender(self):
-        """Pulls audio chunks from Gemini's output queue and streams them to the client."""
         if not self.bridge:
             return
         try:
@@ -2185,25 +2234,6 @@ class WsCallHandler:
             logger.error(f"[{self.call_id}] Audio sender error: {e}")
 
     def _build_insert_enquiry_blocks(self, transcript: str, collected_info) -> list:
-        """
-        Assemble the batch of r_type blocks to send to insert_enquiry_service.
-
-        This follows SchoolKnot's documented r_type payload format exactly
-        (see schoolknot_api.build_new_enquiry_block / build_walkin_block /
-        build_followup_block / build_other_request_block):
-
-            r_type=1  -> new enquiry insert
-            r_type=2  -> schedule a walk-in
-            r_type=3  -> schedule/update a follow-up date
-            r_type=4  -> free-text note against an enquiry
-
-        NOTE: this only builds blocks from data actually captured during
-        the call. If nothing was captured, it returns an empty list --
-        _cleanup() below is responsible for guaranteeing the insert API
-        still fires every time by substituting a fallback r_type=4 note
-        when this returns empty.
-        """
-
         blocks = []
 
         if collected_info is None:
@@ -2340,20 +2370,6 @@ class WsCallHandler:
         return blocks
 
     def _build_fallback_note_block(self, transcript: str) -> dict:
-        """
-        r_type=4 fallback block used when _build_insert_enquiry_blocks()
-        returns nothing to send. Guarantees insert_enquiry_service is
-        always called once per finished call, per SchoolKnot's requested
-        "call ends -> insert API fires" behaviour, even when the caller
-        gave no structured data (hung up early, silent call, wrong
-        number, etc).
-
-        Kept short and uses the SAME r_type=4 shape SchoolKnot already
-        expects (schoolknot_api.build_other_request_block), so the
-        payload format matches what they specified -- this is not a new
-        block type, just the normal free-text note used with a generic
-        message and (when known) the enquiry_id attached.
-        """
         duration_s = None
         if self._call_start_time:
             duration_s = int((datetime.now(timezone.utc) - self._call_start_time).total_seconds())
@@ -2370,7 +2386,7 @@ class WsCallHandler:
 
         return schoolknot_api.build_other_request_block(
             requested_for=note,
-            enquiry_id=self._enquiry_id,  # omitted automatically if None
+            enquiry_id=self._enquiry_id,
         )
 
     async def _cleanup(self):
@@ -2401,6 +2417,15 @@ class WsCallHandler:
                 pass
             except Exception as e:
                 logger.error(f"[{self.call_id}] Error awaiting silence watcher during cleanup: {e}")
+
+        if self._mid_call_watchdog_task:
+            self._mid_call_watchdog_task.cancel()
+            try:
+                await self._mid_call_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"[{self.call_id}] Error awaiting mid-call watchdog during cleanup: {e}")
 
         if self._hangup_watchdog_task:
             self._hangup_watchdog_task.cancel()
@@ -2443,12 +2468,6 @@ class WsCallHandler:
             except Exception as e:
                 logger.error(f"[{self.call_id}] Failed to save recording: {e}")
 
-        # -- SchoolKnot insert -------------------------------------------------
-        # GUARANTEED to fire once per completed call. If real structured
-        # data was captured during the call, that goes out (same r_type
-        # block format SchoolKnot specified). If nothing was captured,
-        # a short r_type=4 fallback note is sent instead of skipping the
-        # call entirely, so SchoolKnot always sees that a call happened.
         try:
             blocks = self._build_insert_enquiry_blocks(transcript, collected_info)
 
@@ -2465,7 +2484,6 @@ class WsCallHandler:
             logger.info(f"[{self.call_id}] insert_enquiry_service SUCCESS -- response: {result}")
         except Exception as e:
             logger.error(f"[{self.call_id}] Failed to call insert_enquiry_service: {e}")
-        # ------------------------------------------------------------------
 
         try:
             from mongo_call_store import save_call_record

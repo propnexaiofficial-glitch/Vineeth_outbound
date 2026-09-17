@@ -741,7 +741,34 @@
 
 #                     # Handle end_call / transfer_call / capture_enquiry_info
 #                     # tool invocations from Gemini
+#                     #
+#                     # 🔧 FIX (silent-agent-after-tool-call bug): the Live
+#                     # API can (and regularly does, as seen in production
+#                     # logs -- e.g. two `capture_enquiry_info` calls fired
+#                     # back-to-back in the same tool_call) pack MULTIPLE
+#                     # function_calls into a single response.tool_call.
+#                     # The old code called self._session.send_tool_response()
+#                     # separately, once per function, inside this loop. The
+#                     # Live API protocol expects ALL function responses for
+#                     # a given tool_call to be sent back together in ONE
+#                     # send_tool_response() call -- sending them one at a
+#                     # time leaves the session waiting on a "complete" set
+#                     # of responses that never arrives as a single batch,
+#                     # and the model simply never continues/resumes the
+#                     # turn. Symptom: agent generates zero further audio or
+#                     # text for the rest of the call (confirmed in logs --
+#                     # e.g. call 24920: two capture_enquiry_info calls at
+#                     # 13:13:17, then total agent silence from then on,
+#                     # with the caller repeating "Hello? Hello?" and every
+#                     # subsequent VAD "interrupted" event reporting 0ms of
+#                     # agent audio ever queued).
+#                     #
+#                     # Fix: collect every FunctionResponse for this
+#                     # tool_call into one list, and send them all in a
+#                     # single send_tool_response() call after the loop.
 #                     if response.tool_call:
+#                         function_responses = []
+
 #                         for fn in response.tool_call.function_calls:
 
 #                             if fn.name == "end_call":
@@ -757,20 +784,13 @@
 #                                         f"[{self.call_sid}] end_call invoked before caller spoke "
 #                                         f"— ignoring (too early)."
 #                                     )
-#                                 try:
-#                                     await self._session.send_tool_response(
-#                                         function_responses=[
-#                                             genai.types.FunctionResponse(
-#                                                 name="end_call",
-#                                                 id=fn.id,
-#                                                 response={"result": "ok"},
-#                                             )
-#                                         ]
+#                                 function_responses.append(
+#                                     genai.types.FunctionResponse(
+#                                         name="end_call",
+#                                         id=fn.id,
+#                                         response={"result": "ok"},
 #                                     )
-#                                 except Exception as e:
-#                                     logger.warning(
-#                                         f"[{self.call_sid}] Could not send end_call tool response: {e}"
-#                                     )
+#                                 )
 
 #                             elif fn.name == "transfer_call":
 #                                 destination = (fn.args or {}).get("destination", "")
@@ -782,20 +802,13 @@
 #                                 self.transfer_requested = True
 #                                 self.transfer_reason = reason
 #                                 self._transfer_destination = destination
-#                                 try:
-#                                     await self._session.send_tool_response(
-#                                         function_responses=[
-#                                             genai.types.FunctionResponse(
-#                                                 name="transfer_call",
-#                                                 id=fn.id,
-#                                                 response={"result": "transferring"},
-#                                             )
-#                                         ]
+#                                 function_responses.append(
+#                                     genai.types.FunctionResponse(
+#                                         name="transfer_call",
+#                                         id=fn.id,
+#                                         response={"result": "transferring"},
 #                                     )
-#                                 except Exception as e:
-#                                     logger.warning(
-#                                         f"[{self.call_sid}] Could not send transfer_call tool response: {e}"
-#                                     )
+#                                 )
 
 #                             # ── NEW: capture_enquiry_info handling ──────
 #                             # This is the PRIMARY path for filling
@@ -875,21 +888,31 @@
 #                                     f"capture_enquiry_info merge: {vars(self.collected_info)}"
 #                                 )
 
-#                                 try:
-#                                     await self._session.send_tool_response(
-#                                         function_responses=[
-#                                             genai.types.FunctionResponse(
-#                                                 name="capture_enquiry_info",
-#                                                 id=fn.id,
-#                                                 response={"result": "ok"},
-#                                             )
-#                                         ]
+#                                 function_responses.append(
+#                                     genai.types.FunctionResponse(
+#                                         name="capture_enquiry_info",
+#                                         id=fn.id,
+#                                         response={"result": "ok"},
 #                                     )
-#                                 except Exception as e:
-#                                     logger.warning(
-#                                         f"[{self.call_sid}] Could not send "
-#                                         f"capture_enquiry_info tool response: {e}"
-#                                     )
+#                                 )
+
+#                         # Send every function response for this tool_call
+#                         # in a single batched call, as the Live API
+#                         # protocol expects when multiple functions were
+#                         # invoked together. See the FIX comment above the
+#                         # `if response.tool_call:` block for why this
+#                         # matters -- sending them one-by-one is what was
+#                         # causing the agent to go permanently silent.
+#                         if function_responses:
+#                             try:
+#                                 await self._session.send_tool_response(
+#                                     function_responses=function_responses
+#                                 )
+#                             except Exception as e:
+#                                 logger.warning(
+#                                     f"[{self.call_sid}] Could not send batched "
+#                                     f"tool response(s) ({[fr.name for fr in function_responses]}): {e}"
+#                                 )
 
 #                 # --- Turn complete: reset playback tracking for the next
 #                 # response (only if we didn't just break out due to an
@@ -927,7 +950,9 @@
 
 #         except Exception as e:
 #             logger.error(
-#                 f"[{self.call_sid}] Gemini receive error: {e}",
+#                 f"[{self.call_sid}] *** GEMINI RECEIVE LOOP DIED *** {type(e).__name__}: {e} "
+#                 f"-- this is why the call goes silent. Check API quota / concurrent "
+#                 f"session limits / network.",
 #                 exc_info=True
 #             )
 
@@ -1015,6 +1040,21 @@
 #         return raw
 """
 GeminiBridge -- manages a single Gemini Live API session for one phone call.
+
+CHANGES IN THIS VERSION (reconnect support):
+  - Tracks `_last_audio_received_at` so a watchdog (in ws_call_handler.py)
+    can detect "session looks dead" from the outside.
+  - `_receive_loop` no longer just logs-and-dies when the Gemini session
+    drops (e.g. WebSocket close 1011, "Internal error encountered",
+    ConnectionClosed, etc). It now attempts up to `_MAX_RECONNECT_ATTEMPTS`
+    automatic reconnects, re-opening a fresh Live session and telling the
+    model to continue naturally instead of restarting the greeting.
+  - Exposed `force_reconnect()` as a public method so an external watchdog
+    (mid-call silence detector) can trigger a reconnect proactively,
+    instead of waiting for an exception to bubble up.
+  - `self.collected_info`, `self.transcript_parts`, `self.transcript_turns`
+    etc. all live on `self` already, so they survive a reconnect untouched
+    -- only the underlying Gemini session/context is torn down and rebuilt.
 """
 
 import asyncio
@@ -1052,6 +1092,22 @@ _OUTPUT_QUEUE_MAXSIZE = 100
 # 8kHz, 16-bit mono PCM => 16000 bytes/sec => 16 bytes/ms
 _PCM_8K_BYTES_PER_MS = 16.0
 
+# --- Reconnect tuning -------------------------------------------------
+# How many times we'll try to silently re-open a dropped Gemini session
+# within a single phone call before giving up and letting the call end.
+# Keep this modest -- each reconnect costs ~1-2s of dead air for the
+# caller, and a call that needs more than a few is probably fighting a
+# platform-wide outage that a retry won't fix anyway.
+_MAX_RECONNECT_ATTEMPTS = 3
+# Small backoff before re-opening, so we don't hammer the API the
+# instant it dropped us (which is often itself a sign of overload).
+_RECONNECT_BACKOFF_SECONDS = 1.0
+# After this many seconds of a fully healthy, audio-flowing session,
+# reset the reconnect-attempt counter back to 0. Without this, a call
+# that has one bad patch early on (recovers fine) would have "used up"
+# attempts it might legitimately need later in the same call.
+_RECONNECT_ATTEMPT_RESET_AFTER_SECONDS = 30.0
+
 
 _CALL_ENDING_PHRASES = [
     "thank you for your time",
@@ -1083,7 +1139,7 @@ class GeminiBridge:
     ):
 
         self.call_sid = call_sid
-        self.lead_id = lead_id         
+        self.lead_id = lead_id
         self.outbound_intro = outbound_intro
         self.prompt_type = prompt_type
         self.org_config = org_config
@@ -1124,6 +1180,7 @@ class GeminiBridge:
             logger.info(f"[{call_sid}] Using Gemini API Key")
 
         self._session = None
+        self._ctx = None
         self._task = None
 
         self.output_queue: asyncio.Queue[
@@ -1153,21 +1210,30 @@ class GeminiBridge:
         self._speech_generation: int = 0
 
         # --- Playback-position tracking ---
-        # Wall-clock time the CURRENT agent response started playing out
-        # (i.e. when the first audio chunk of this response was queued).
-        # Used to estimate how much of the response the caller actually
-        # heard before an interruption, instead of relying on the
-        # queue-drain count (which only reflects *unsent* chunks and is
-        # frequently 0 even when the caller clearly barged in mid-sentence).
         self._response_started_at: Optional[float] = None
-        # Total duration (ms) of audio queued for the current response so far.
         self._audio_ms_sent: float = 0.0
+
+        # --- Reconnect / session-health tracking ---
+        # Updated every time we actually receive an audio chunk from
+        # Gemini. A watchdog outside this class (ws_call_handler) can
+        # read this to notice "no audio in N seconds" and force a
+        # reconnect proactively, without waiting for an exception.
+        self._last_audio_received_at: float = time.monotonic()
+        # Also updated on ANY inbound event (text, tool call, transcription
+        # -- not just audio), since a session can be "alive" while the
+        # model is just thinking/using tools without producing audio yet.
+        self._last_event_received_at: float = time.monotonic()
+        self._reconnect_attempts: int = 0
+        self._reconnecting: bool = False
+        self._reconnect_lock = asyncio.Lock()
+        # Set once we give up after exhausting _MAX_RECONNECT_ATTEMPTS,
+        # so ws_call_handler can tell "call ended normally" apart from
+        # "call died because Gemini would not stay connected".
+        self.session_permanently_lost: bool = False
 
     def _append_turn(self, speaker: str, text: str):
         """Appends one turn to the structured transcript, merging
-        into the previous entry if it's from the same speaker back-to-back
-        (mirrors the merge behaviour transcript_parts already does for
-        consecutive caller chunks)."""
+        into the previous entry if it's from the same speaker back-to-back."""
         if not text:
             return
         if self.transcript_turns and self.transcript_turns[-1]["speaker"] == speaker:
@@ -1179,20 +1245,16 @@ class GeminiBridge:
                 "timestamp": datetime.now(timezone.utc),
             })
 
-    async def start(self, send_greeting: bool = True):
+    def _build_live_config(self):
+        """Builds the LiveConnectConfig used to open (or re-open) the
+        Gemini Live session. Split out of start() so _reconnect() can
+        call it again without duplicating all of this setup logic.
+        """
         system_prompt = build_system_prompt(
             prompt_type=self.prompt_type,
             org_config=self.org_config,
         )
 
-        # FIX: capture_enquiry_info's callback_time field needs to come
-        # back as an absolute 'YYYY-MM-DD HH:MM:SS' string so it can be
-        # sent straight through to SchoolKnot's schedule_walkin_date /
-        # follow_up_date fields. The model can only resolve relative
-        # terms like "Friday" or "tomorrow 5pm" into an actual date if
-        # it knows what "today" is — build_system_prompt() has no way to
-        # know that on its own, so inject it here, right before the
-        # session is opened, using the real current date for this call.
         today = datetime.now()
         date_context = (
             f"\n\nToday's date and time is {today.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -1255,37 +1317,6 @@ class GeminiBridge:
                         required=["destination"],
                     ),
                 ),
-                # ── NEW: capture_enquiry_info ──────────────────────────
-                # WHY THIS TOOL EXISTS:
-                # The old pipeline extracted child_name / father_name /
-                # dob / grade etc. purely with regex over the caller's
-                # ASR transcript (school_extractor.py). That regex only
-                # matches Latin-script text ([A-Z][a-zA-Z]+...). Gemini's
-                # input_audio_transcription does NOT reliably transcribe
-                # every call in the same script — a Hindi/Hinglish caller
-                # can come back as Devanagari ("राहुल"), Latin ("Rahul"),
-                # or mixed, and this varies turn-to-turn, not just
-                # call-to-call. Whenever the transcript came back in
-                # Devanagari, the regex silently found nothing and the
-                # field stayed None — even though the caller clearly said
-                # it and the agent's own next line proved it "heard" the
-                # name.
-                #
-                # Rather than trying to keep extending the regex to cover
-                # every script/spelling permutation (a losing battle),
-                # the model itself — which already understands the
-                # conversation regardless of script/language — now
-                # reports each field directly via this tool the moment
-                # the caller states it. This is fully script-independent:
-                # the model can hear "राहुल", "Rahul", or "rahul" and
-                # report the same normalized value.
-                #
-                # The regex extractor (school_extractor.py) is NOT
-                # removed — it still runs on every caller chunk as a
-                # fallback/safety net. Both write into the same
-                # EnquiryInfo via the same COALESCE-style _merge_info(),
-                # so whichever source captures a field first "wins" and
-                # neither can overwrite an already-known value with None.
                 _types.FunctionDeclaration(
                     name="capture_enquiry_info",
                     description=(
@@ -1337,19 +1368,6 @@ class GeminiBridge:
                                 type="STRING",
                                 description="School branch/location the caller wants, e.g. 'Attapur', 'Katedan', if mentioned.",
                             ),
-                            # FIX: previously described as a free-form
-                            # example ("e.g. 'tomorrow 5pm'"), which is
-                            # exactly what the model reported back verbatim
-                            # — "tomorrow 5pm" / "Friday" / etc. That raw
-                            # string then flowed straight into
-                            # schedule_walkin_date / follow_up_date in
-                            # ws_call_handler._build_insert_enquiry_blocks()
-                            # with no conversion, so SchoolKnot either
-                            # rejected it or silently stored nothing
-                            # useful. Now explicitly require the absolute
-                            # 'YYYY-MM-DD HH:MM:SS' format, resolved
-                            # against the "today's date" context injected
-                            # into the system prompt above.
                             "callback_time": _types.Schema(
                                 type="STRING",
                                 description=(
@@ -1376,21 +1394,6 @@ class GeminiBridge:
             ]
         )
 
-        # FIX: installed google-genai SDK versions vary in whether
-        # SpeechConfig declares a `language_code` field. Older versions'
-        # SpeechConfig model does NOT have this field, and since these
-        # models are built with extra="forbid", passing language_code=
-        # unconditionally raises:
-        #   ValidationError: 1 validation error for SpeechConfig
-        #   language_code -> Extra inputs are not permitted [extra_forbidden]
-        # (This is exactly what crashed bridge.start() with
-        # AGENT_LANGUAGE='hi-IN'.)
-        #
-        # The real fix is to upgrade google-genai (`pip install --upgrade
-        # google-genai`) so SpeechConfig supports language_code natively.
-        # This guard just makes start() resilient in the meantime instead
-        # of hard-crashing every call: it only passes language_code
-        # through if the installed SDK's SpeechConfig actually accepts it.
         speech_config_kwargs = {
             "voice_config": _types.VoiceConfig(
                 prebuilt_voice_config=_types.PrebuiltVoiceConfig(
@@ -1424,21 +1427,6 @@ class GeminiBridge:
             "input_audio_transcription": _types.AudioTranscriptionConfig(),
         }
 
-        # FIX: same story as SpeechConfig.language_code above — older
-        # installed google-genai versions don't have a RealtimeInputConfig
-        # (or AutomaticActivityDetection) class in google.genai.types AT
-        # ALL, so referencing _types.RealtimeInputConfig unconditionally
-        # raises AttributeError and crashes bridge.start() before the
-        # session ever opens:
-        #   AttributeError: module 'google.genai.types' has no attribute
-        #   'RealtimeInputConfig'
-        #
-        # The real fix is upgrading google-genai (`pip install --upgrade
-        # google-genai`) — automatic VAD / barge-in detection is enabled
-        # server-side by default on essentially every version, so omitting
-        # this explicit config on an old SDK does not disable barge-in,
-        # it just means we're relying on the server default instead of
-        # stating it explicitly.
         if hasattr(_types, "RealtimeInputConfig") and hasattr(_types, "AutomaticActivityDetection"):
             config_kwargs["realtime_input_config"] = _types.RealtimeInputConfig(
                 automatic_activity_detection=_types.AutomaticActivityDetection(
@@ -1453,7 +1441,33 @@ class GeminiBridge:
                 f"applies). Run `pip install --upgrade google-genai` to fix."
             )
 
-        config = _types.LiveConnectConfig(**config_kwargs)
+        # Ask the Live API to hand us a resumption handle so a reconnect
+        # (see _reconnect() below) has a chance of resuming server-side
+        # context instead of starting a completely blank session. If the
+        # installed SDK doesn't support this yet, we just skip it and
+        # fall back to a fresh session + a manual "continue naturally"
+        # text nudge on reconnect.
+        if hasattr(_types, "SessionResumptionConfig"):
+            resumption_kwargs = {}
+            handle = getattr(self, "_resumption_handle", None)
+            if handle:
+                resumption_kwargs["handle"] = handle
+            config_kwargs["session_resumption"] = _types.SessionResumptionConfig(
+                **resumption_kwargs
+            )
+        else:
+            logger.warning(
+                f"[{self.call_sid}] Installed google-genai has no "
+                f"SessionResumptionConfig — reconnects will start a fresh "
+                f"session with a manual continuity nudge instead of true "
+                f"server-side resumption. Run `pip install --upgrade "
+                f"google-genai` for better reconnect behaviour."
+            )
+
+        return _types.LiveConnectConfig(**config_kwargs)
+
+    async def start(self, send_greeting: bool = True):
+        config = self._build_live_config()
 
         self._ctx = self._client.aio.live.connect(
             model=GEMINI_MODEL,
@@ -1462,13 +1476,14 @@ class GeminiBridge:
 
         self._session = await self._ctx.__aenter__()
         self._active = True
+        self._last_audio_received_at = time.monotonic()
+        self._last_event_received_at = time.monotonic()
 
         logger.info(f"[{self.call_sid}] Gemini session opened.")
 
         self._task = asyncio.create_task(self._receive_loop())
 
         if send_greeting:
-
             if self.outbound_intro:
                 msg = (
                     f'(Start the call. Say exactly and only: '
@@ -1479,8 +1494,135 @@ class GeminiBridge:
 
             await self._session.send_realtime_input(text=msg)
 
-    async def stop(self):
+    async def _close_session_quietly(self):
+        """Tears down the current Gemini session/context without raising,
+        used both by stop() and by _reconnect() before opening a new one.
+        """
+        if self._ctx is not None:
+            try:
+                await self._ctx.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning(
+                    f"[{self.call_sid}] Error closing old Gemini session "
+                    f"during teardown (safe to ignore if it was already "
+                    f"dead): {e}"
+                )
+        self._session = None
+        self._ctx = None
 
+    async def force_reconnect(self, reason: str = "external_watchdog") -> bool:
+        """Public entry point for an external watchdog (e.g.
+        ws_call_handler's mid-call silence watchdog) to proactively
+        force a reconnect BEFORE an exception even happens -- useful
+        because a hung/degraded Gemini session can sit there not
+        throwing anything while simply never producing audio again
+        (several of the reported gemini-3.1-flash-live-preview bugs
+        look exactly like this: connection stays "open" but silent).
+        """
+        return await self._reconnect(reason=reason)
+
+    async def _reconnect(self, reason: str = "receive_loop_exception") -> bool:
+        """Attempts to re-open a fresh Gemini Live session in place of a
+        dead/degraded one, preserving all call state (collected_info,
+        transcripts, etc, which live on self and are untouched here).
+
+        Returns True if reconnect succeeded and the call should continue,
+        False if we've exhausted our attempts and the caller should treat
+        the session as permanently lost.
+        """
+        async with self._reconnect_lock:
+            if not self._active:
+                # stop() already called / call ending anyway -- nothing to do.
+                return False
+
+            if self._reconnect_attempts >= _MAX_RECONNECT_ATTEMPTS:
+                logger.error(
+                    f"[{self.call_sid}] Giving up on Gemini reconnect after "
+                    f"{self._reconnect_attempts} attempts (reason={reason!r}) "
+                    f"-- ending call."
+                )
+                self.session_permanently_lost = True
+                return False
+
+            self._reconnect_attempts += 1
+            attempt_no = self._reconnect_attempts
+            logger.warning(
+                f"[{self.call_sid}] *** Attempting Gemini reconnect "
+                f"{attempt_no}/{_MAX_RECONNECT_ATTEMPTS} (reason={reason!r}) ***"
+            )
+
+            # Cancel the old receive task if it's somehow still running
+            # (e.g. force_reconnect called proactively while the old task
+            # is stuck, not actually dead yet).
+            old_task = self._task
+            if old_task is not None and old_task is not asyncio.current_task():
+                old_task.cancel()
+                try:
+                    await old_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            await self._close_session_quietly()
+            await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
+
+            try:
+                config = self._build_live_config()
+                self._ctx = self._client.aio.live.connect(
+                    model=GEMINI_MODEL,
+                    config=config,
+                )
+                self._session = await self._ctx.__aenter__()
+                self._last_audio_received_at = time.monotonic()
+                self._last_event_received_at = time.monotonic()
+
+                # Tell the model to pick the conversation back up instead
+                # of re-greeting the caller from scratch. Without true
+                # session_resumption support, the model has NO memory of
+                # what was said before this point -- so we also hand it a
+                # short recap built from whatever we've captured so far,
+                # which is far better than nothing even if it's not a full
+                # transcript replay.
+                recap_bits = []
+                info = self.collected_info
+                if getattr(info, "child_name", None):
+                    recap_bits.append(f"child's name: {info.child_name}")
+                if getattr(info, "admission_opted_for", None):
+                    recap_bits.append(f"grade: {info.admission_opted_for}")
+                if getattr(info, "branch_name", None):
+                    recap_bits.append(f"branch: {info.branch_name}")
+                recap = (
+                    (" Known so far -- " + "; ".join(recap_bits) + ".")
+                    if recap_bits else ""
+                )
+
+                continuity_msg = (
+                    "(The connection dropped for a moment and has just been "
+                    "restored. Do NOT re-introduce yourself or restart the "
+                    "greeting. Briefly and naturally acknowledge the short "
+                    "pause -- e.g. 'sorry, network mein thoda gap aa gaya' -- "
+                    "then continue the conversation from where it left off."
+                    + recap +
+                    ")"
+                )
+                await self._session.send_realtime_input(text=continuity_msg)
+
+                self._task = asyncio.create_task(self._receive_loop())
+
+                logger.info(
+                    f"[{self.call_sid}] Gemini reconnect {attempt_no} "
+                    f"succeeded -- new session opened."
+                )
+                return True
+
+            except Exception as e:
+                logger.error(
+                    f"[{self.call_sid}] Gemini reconnect {attempt_no} FAILED: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                return False
+
+    async def stop(self):
         self._active = False
 
         try:
@@ -1495,49 +1637,54 @@ class GeminiBridge:
             except asyncio.CancelledError:
                 pass
 
-        if self._session:
-            try:
-                await self._ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
+        await self._close_session_quietly()
 
         logger.info(f"[{self.call_sid}] Gemini session closed.")
 
     async def send_audio(self, pcm_8k: bytes):
-
         if not self._active or not self._session:
             return
 
-        self._caller_has_spoken = True  # caller has sent audio — safe to end later
+        self._caller_has_spoken = True
         self._last_speech_time = time.monotonic()
 
         pcm_16k = await resample_stream_async(self._upsampler, pcm_8k)
 
-        await self._session.send_realtime_input(
-            audio=genai.types.Blob(
-                data=pcm_16k,
-                mime_type="audio/pcm;rate=16000"
+        try:
+            await self._session.send_realtime_input(
+                audio=genai.types.Blob(
+                    data=pcm_16k,
+                    mime_type="audio/pcm;rate=16000"
+                )
             )
-        )
+        except Exception as e:
+            # Sending into a dead/dropped session raises here rather than
+            # in _receive_loop. Treat it the same way -- let the receive
+            # loop's own exception handling / reconnect take over on its
+            # next iteration; just don't crash the caller of send_audio.
+            logger.warning(
+                f"[{self.call_sid}] send_audio failed (session likely "
+                f"dropped, reconnect should follow): {type(e).__name__}: {e}"
+            )
 
     def seconds_since_speech(self) -> float:
-        """Used by ws_call_handler._silence_watcher() to end the
-        call after a period of caller silence."""
         return time.monotonic() - self._last_speech_time
+
+    def seconds_since_last_audio(self) -> float:
+        """Used by ws_call_handler's mid-call watchdog to detect a
+        session that looks alive but has stopped producing any output."""
+        return time.monotonic() - self._last_audio_received_at
+
+    def seconds_since_last_event(self) -> float:
+        return time.monotonic() - self._last_event_received_at
 
     @staticmethod
     def _chunk_duration_ms(pcm_8k: bytes) -> float:
-        """Duration in ms of an 8kHz, 16-bit mono PCM chunk."""
         return len(pcm_8k) / _PCM_8K_BYTES_PER_MS
 
     def _handle_interruption(self):
-
         self._speech_generation += 1
 
-        # --- Estimate how much of the current response the caller
-        # actually heard, based on wall-clock elapsed time since the
-        # response started playing, capped at how much audio we'd
-        # actually queued (we can't have played more than we sent).
         played_ms = 0.0
         if self._response_started_at is not None:
             elapsed_ms = (time.monotonic() - self._response_started_at) * 1000
@@ -1552,12 +1699,6 @@ class GeminiBridge:
                 break
 
         self._interrupted_flag = True
-
-        # The response that was just cut off is being discarded entirely —
-        # its resampler filter state no longer corresponds to anything
-        # we're going to play. Reset it so the NEXT response's downsampling
-        # starts clean instead of dragging in leftover state from audio
-        # that will never be heard.
         self._downsampler.reset()
 
         logger.info(
@@ -1567,441 +1708,318 @@ class GeminiBridge:
             f"{self._speech_generation}."
         )
 
-        # Reset playback tracking — the next response (if any) starts fresh.
         self._response_started_at = None
         self._audio_ms_sent = 0.0
 
     async def _receive_loop(self):
+        """Outer supervisor: keeps re-entering `_receive_one_session()`
+        (which does the actual work) whenever it dies, up to
+        _MAX_RECONNECT_ATTEMPTS times, before giving up for good.
+        """
+        last_healthy_at = time.monotonic()
 
-        try:
+        while self._active:
+            try:
+                await self._receive_one_session()
+                # _receive_one_session only returns normally when
+                # self._active flips False (i.e. stop() was called) --
+                # a genuinely dead/closed session raises instead. So
+                # reaching here means a clean shutdown; just exit.
+                break
 
-            while self._active:
+            except asyncio.CancelledError:
+                raise
 
-                turn = self._session.receive()
+            except Exception as e:
+                logger.error(
+                    f"[{self.call_sid}] *** GEMINI RECEIVE LOOP DIED *** "
+                    f"{type(e).__name__}: {e} -- attempting reconnect "
+                    f"instead of ending the call silently.",
+                    exc_info=True,
+                )
 
-                # Capture which "generation" this turn belongs to. If an
-                # interruption bumps the generation counter while we're
-                # mid-turn, any further chunks from *this* turn are stale
-                # and must be dropped instead of queued.
-                turn_generation = self._speech_generation
+                if not self._active:
+                    break
 
-                # accumulate this turn's agent text and only run
-                # the closing/transfer phrase check ONCE, on the FULL
-                # utterance, after the turn is complete. Checking on every
-                # individual streamed chunk (the old behaviour) could
-                # false-fire on a phrase split across two chunks, or match
-                # too early before the agent had actually finished the
-                # thought — which is very likely what was causing calls to
-                # be cut off mid-conversation.
-                turn_text_parts: list[str] = []
+                # A long stretch of healthy audio flow resets the
+                # attempt counter, so one bad patch early in a long
+                # call doesn't burn through the budget we might need
+                # for a genuinely separate problem later.
+                if time.monotonic() - last_healthy_at > _RECONNECT_ATTEMPT_RESET_AFTER_SECONDS:
+                    self._reconnect_attempts = 0
 
-                async for response in turn:
+                reconnected = await self._reconnect(reason=f"{type(e).__name__}: {e}")
+                if not reconnected:
+                    try:
+                        self.output_queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+                    break
 
-                    if not self._active:
-                        break
+                last_healthy_at = time.monotonic()
+                # loop back around -- _reconnect() already created the
+                # new self._task running a fresh _receive_loop() for the
+                # new session, so THIS particular loop instance is done;
+                # let it exit cleanly rather than double-supervising.
+                return
 
-                    # handle caller barge-in / interruption.
-                    # Gemini sets server_content.interrupted = True the
-                    # moment its VAD detects the caller started speaking
-                    # while the agent's audio was still playing out.
-                    sc = getattr(response, "server_content", None)
-                    if sc and getattr(sc, "interrupted", False):
-                        logger.info(
-                            f"[{self.call_sid}] Caller interrupted the agent — "
-                            f"clearing pending audio."
+    async def _receive_one_session(self):
+        """The actual per-session receive logic (previously the whole
+        body of _receive_loop). Runs until the session dies (raises) or
+        self._active goes False (returns normally).
+        """
+        while self._active:
+
+            turn = self._session.receive()
+            turn_generation = self._speech_generation
+            turn_text_parts: list[str] = []
+
+            async for response in turn:
+
+                if not self._active:
+                    break
+
+                self._last_event_received_at = time.monotonic()
+
+                sc = getattr(response, "server_content", None)
+                if sc and getattr(sc, "interrupted", False):
+                    logger.info(
+                        f"[{self.call_sid}] Caller interrupted the agent — "
+                        f"clearing pending audio."
+                    )
+                    self._handle_interruption()
+                    break
+
+                if response.data:
+                    if turn_generation != self._speech_generation:
+                        continue
+
+                    raw_pcm = response.data
+                    if isinstance(raw_pcm, str):
+                        raw_pcm = base64.b64decode(raw_pcm)
+
+                    pcm_8k = await resample_stream_async(
+                        self._downsampler, bytes(raw_pcm)
+                    )
+
+                    self._last_audio_received_at = time.monotonic()
+
+                    if self._response_started_at is None:
+                        self._response_started_at = time.monotonic()
+                    self._audio_ms_sent += self._chunk_duration_ms(pcm_8k)
+
+                    try:
+                        self.output_queue.put_nowait(pcm_8k)
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            f"[{self.call_sid}] Audio queue full (maxsize="
+                            f"{_OUTPUT_QUEUE_MAXSIZE}) -- dropping a Gemini "
+                            f"audio chunk. This means _audio_sender is "
+                            f"falling behind Gemini's output rate; check "
+                            f"for network/pacing issues on the outbound leg."
                         )
-                        self._handle_interruption()
 
-                        # 🔧 FIX: break out of THIS turn's async-for instead
-                        # of trying to keep consuming it with a stale-
-                        # generation check on every subsequent chunks.
-                        #
-                        # Previously we relied purely on
-                        # `turn_generation != self._speech_generation` to
-                        # drop stale audio/text for the rest of this turn.
-                        # That's correct for *trailing/buffered* audio from
-                        # the interrupted response — but if Gemini's SDK
-                        # ever continues streaming a genuinely NEW response
-                        # (e.g. answering the caller's new question) inside
-                        # this same `turn` async-generator, that new content
-                        # would ALSO get silently dropped, because
-                        # turn_generation was captured before the bump and
-                        # never gets resynced.
-                        #
-                        # Breaking here ends this turn's iteration
-                        # immediately. The outer `while self._active` loop
-                        # then calls `self._session.receive()` again,
-                        # starting a brand new turn whose `turn_generation`
-                        # is captured fresh (== the post-bump value), so any
-                        # real new response is no longer misclassified as
-                        # stale.
-                        break
+                if response.text:
+                    text = response.text
+                    logger.info(f"[{self.call_sid}] Agent: {text}")
+                    self.transcript_parts.append(f"{AGENT_NAME}: {text}")
+                    turn_text_parts.append(text)
+                    self._append_turn("agent", text)
 
-                    if response.data:
-
-                        # Stale turn — an interruption happened after this
-                        # turn started, so this audio must not be sent.
-                        if turn_generation != self._speech_generation:
-                            continue
-
-                        raw_pcm = response.data
-
-                        if isinstance(raw_pcm, str):
-                            raw_pcm = base64.b64decode(raw_pcm)
-
-                        pcm_8k = await resample_stream_async(
-                            self._downsampler, bytes(raw_pcm)
-                        )
-
-                        # Playback tracking: mark when this response's audio
-                        # started, and accumulate how much we've queued.
-                        if self._response_started_at is None:
-                            self._response_started_at = time.monotonic()
-                        self._audio_ms_sent += self._chunk_duration_ms(pcm_8k)
-
-                        try:
-                            self.output_queue.put_nowait(pcm_8k)
-                        except asyncio.QueueFull:
-                            logger.warning("Audio queue full")
-
-                    if response.text:
-
-                        text = response.text
-                        logger.info(f"[{self.call_sid}] Agent: {text}")
-                        self.transcript_parts.append(f"{AGENT_NAME}: {text}")
-                        turn_text_parts.append(text)
-                        self._append_turn("agent", text)
-
-                        # NOTE: we intentionally do NOT run
-                        # extract_from_chunk() on the agent's own text.
-                        # The agent mostly asks questions ("What's your
-                        # child's name?"); the actual answers (name, grade,
-                        # DOB, etc.) come from the CALLER, and are extracted
-                        # below from input_transcription instead. Running
-                        # extraction here too is harmless but rarely finds
-                        # anything, since the agent doesn't usually restate
-                        # facts back verbatim.
-
-                    # Check server_content for both input and output transcription
-                    if sc:
-                        # Output transcription — agent's spoken closing words
-                        ot = getattr(sc, "output_transcription", None)
-                        if ot:
-                            agent_text = (ot.text or "").strip().lower()
-                            if agent_text and self._caller_has_spoken and not self.call_should_end:
-                                if any(p in agent_text for p in _CALL_ENDING_PHRASES):
-                                    logger.info(
-                                        f"[{self.call_sid}] Closing phrase in output_transcription "
-                                        f"({agent_text!r}) — ending call."
-                                    )
-                                    self.call_should_end = True
-
-                        # Input transcription — caller's spoken words
-                        it = getattr(sc, "input_transcription", None)
-                        if it:
-                            caller_text = (it.text or "").strip()
-                            if caller_text:
-                                logger.info(f"[{self.call_sid}] Caller: {caller_text}")
-                                if (
-                                    self.transcript_parts
-                                    and self.transcript_parts[-1].startswith("Customer:")
-                                ):
-                                    self.transcript_parts[-1] += caller_text
-                                else:
-                                    self.transcript_parts.append(f"Customer:{caller_text}")
-                                self._append_turn("caller", caller_text)
-
-                                # FALLBACK / safety-net extraction: structured
-                                # admission info (ward name, grade, DOB, etc.)
-                                # from what the CALLER said via regex. This is
-                                # NOT the primary path anymore — it only
-                                # catches fields the LLM's capture_enquiry_info
-                                # tool call (below, in the tool_call handling
-                                # block) misses. _merge_info() is COALESCE-
-                                # style, so whichever source (LLM tool call or
-                                # this regex) reports a field FIRST wins, and
-                                # neither can blank out a value the other
-                                # already captured. Kept because it's script-
-                                # independent-input-agnostic in the sense that
-                                # it costs nothing extra and adds resilience
-                                # if the LLM ever skips calling the tool for a
-                                # turn (e.g. mid-interruption).
-                                chunk_info = extract_from_chunk(self.call_sid, caller_text)
-                                if chunk_info:
-                                    self._merge_info(chunk_info)
-                                    upsert_info(self.collected_info)
-
-                                caller_closing = [
-                                    "thank you", "thanks", "bye", "ok bye",
-                                    "goodbye", "dhanyawad", "shukriya",
-                                    "alvida", "that's all", "thats all",
-                                ]
-                                lowered_caller = caller_text.lower()
-                                if (
-                                    self._caller_has_spoken
-                                    and not self.call_should_end
-                                    and any(p in lowered_caller for p in caller_closing)
-                                ):
-                                    logger.info(
-                                        f"[{self.call_sid}] Caller closing phrase detected "
-                                        f"({caller_text!r}) — ending call in 2s."
-                                    )
-
-                                    async def _delayed_caller_hangup():
-                                        await asyncio.sleep(2)
-                                        if not self.call_should_end:
-                                            self.call_should_end = True
-
-                                    asyncio.create_task(_delayed_caller_hangup())
-
-                    # Handle end_call / transfer_call / capture_enquiry_info
-                    # tool invocations from Gemini
-                    #
-                    # 🔧 FIX (silent-agent-after-tool-call bug): the Live
-                    # API can (and regularly does, as seen in production
-                    # logs -- e.g. two `capture_enquiry_info` calls fired
-                    # back-to-back in the same tool_call) pack MULTIPLE
-                    # function_calls into a single response.tool_call.
-                    # The old code called self._session.send_tool_response()
-                    # separately, once per function, inside this loop. The
-                    # Live API protocol expects ALL function responses for
-                    # a given tool_call to be sent back together in ONE
-                    # send_tool_response() call -- sending them one at a
-                    # time leaves the session waiting on a "complete" set
-                    # of responses that never arrives as a single batch,
-                    # and the model simply never continues/resumes the
-                    # turn. Symptom: agent generates zero further audio or
-                    # text for the rest of the call (confirmed in logs --
-                    # e.g. call 24920: two capture_enquiry_info calls at
-                    # 13:13:17, then total agent silence from then on,
-                    # with the caller repeating "Hello? Hello?" and every
-                    # subsequent VAD "interrupted" event reporting 0ms of
-                    # agent audio ever queued).
-                    #
-                    # Fix: collect every FunctionResponse for this
-                    # tool_call into one list, and send them all in a
-                    # single send_tool_response() call after the loop.
-                    if response.tool_call:
-                        function_responses = []
-
-                        for fn in response.tool_call.function_calls:
-
-                            if fn.name == "end_call":
-                                reason = (fn.args or {}).get("reason", "call_completed")
-                                if self._caller_has_spoken:
-                                    logger.info(
-                                        f"[{self.call_sid}] end_call tool invoked "
-                                        f"(reason={reason!r}) — setting call_should_end."
-                                    )
-                                    self.call_should_end = True
-                                else:
-                                    logger.warning(
-                                        f"[{self.call_sid}] end_call invoked before caller spoke "
-                                        f"— ignoring (too early)."
-                                    )
-                                function_responses.append(
-                                    genai.types.FunctionResponse(
-                                        name="end_call",
-                                        id=fn.id,
-                                        response={"result": "ok"},
-                                    )
-                                )
-
-                            elif fn.name == "transfer_call":
-                                destination = (fn.args or {}).get("destination", "")
-                                reason = (fn.args or {}).get("reason", "transfer_requested")
+                if sc:
+                    ot = getattr(sc, "output_transcription", None)
+                    if ot:
+                        agent_text = (ot.text or "").strip().lower()
+                        if agent_text and self._caller_has_spoken and not self.call_should_end:
+                            if any(p in agent_text for p in _CALL_ENDING_PHRASES):
                                 logger.info(
-                                    f"[{self.call_sid}] transfer_call tool invoked "
-                                    f"(destination={destination!r}, reason={reason!r})."
+                                    f"[{self.call_sid}] Closing phrase in output_transcription "
+                                    f"({agent_text!r}) — ending call."
                                 )
-                                self.transfer_requested = True
-                                self.transfer_reason = reason
-                                self._transfer_destination = destination
-                                function_responses.append(
-                                    genai.types.FunctionResponse(
-                                        name="transfer_call",
-                                        id=fn.id,
-                                        response={"result": "transferring"},
-                                    )
-                                )
+                                self.call_should_end = True
 
-                            # ── NEW: capture_enquiry_info handling ──────
-                            # This is the PRIMARY path for filling
-                            # collected_info now. Script/language-
-                            # independent by construction — the model
-                            # reports whatever it understood, already
-                            # normalized to Latin script, regardless of
-                            # what script the caller's speech was
-                            # transcribed in.
-                            elif fn.name == "capture_enquiry_info":
-                                args = fn.args or {}
-                                logger.info(
-                                    f"[{self.call_sid}] capture_enquiry_info tool "
-                                    f"invoked — args={args}"
-                                )
+                    it = getattr(sc, "input_transcription", None)
+                    if it:
+                        caller_text = (it.text or "").strip()
+                        if caller_text:
+                            logger.info(f"[{self.call_sid}] Caller: {caller_text}")
+                            if (
+                                self.transcript_parts
+                                and self.transcript_parts[-1].startswith("Customer:")
+                            ):
+                                self.transcript_parts[-1] += caller_text
+                            else:
+                                self.transcript_parts.append(f"Customer:{caller_text}")
+                            self._append_turn("caller", caller_text)
 
-                                # FIX: the raw grade string the LLM reports
-                                # (e.g. "11" for "Class 11") is NOT the
-                                # SchoolKnot admission_opted_for code —
-                                # SchoolKnot's codes don't line up 1:1 with
-                                # the class number (code 11 = Class 7,
-                                # code 15 = Class 11; see the doc's
-                                # "Admission opted for" table). Previously
-                                # this raw value was sent straight through,
-                                # silently storing the wrong grade for every
-                                # enquiry captured via this (primary) path.
-                                # Route it through the same grade_to_code()
-                                # mapping the regex fallback in
-                                # school_extractor.py already used, so both
-                                # paths always produce the identical,
-                                # correct SchoolKnot code.
-                                raw_grade = args.get("grade") or None
-                                grade_code = grade_to_code(raw_grade)
-                                if raw_grade and grade_code is None:
-                                    logger.warning(
-                                        f"[{self.call_sid}] capture_enquiry_info "
-                                        f"reported grade {raw_grade!r} but it did "
-                                        f"not match any known SchoolKnot grade — "
-                                        f"leaving admission_opted_for unset rather "
-                                        f"than sending a possibly-wrong code."
-                                    )
-
-                                # FIX: normalize callback_time as a
-                                # safety net even though the prompt/schema
-                                # now asks the model for an absolute
-                                # 'YYYY-MM-DD HH:MM:SS' value. If the model
-                                # still reports something relative (e.g.
-                                # "Friday") or malformed, this converts it
-                                # before it ever reaches collected_info /
-                                # ws_call_handler, instead of relying on
-                                # ws_call_handler to catch it later.
-                                raw_callback_time = args.get("callback_time") or None
-                                normalized_callback_time = _normalize_callback_time(
-                                    raw_callback_time, self.call_sid
-                                )
-
-                                visit_val = args.get("visit_requested")
-                                chunk_info = EnquiryInfo(
-                                    lead_id=self.call_sid,
-                                    child_name=(args.get("child_name") or None),
-                                    father_name=(args.get("father_name") or None),
-                                    mother_name=(args.get("mother_name") or None),
-                                    dob=(args.get("dob") or None),
-                                    admission_opted_for=grade_code,
-                                    email=(args.get("email") or None),
-                                    mother_mobile=(args.get("mother_mobile") or None),
-                                    branch_name=(args.get("branch") or None),
-                                    callback_time=normalized_callback_time,
-                                    visit_requested=bool(visit_val) if visit_val is not None else False,
-                                )
-
+                            chunk_info = extract_from_chunk(self.call_sid, caller_text)
+                            if chunk_info:
                                 self._merge_info(chunk_info)
                                 upsert_info(self.collected_info)
 
+                            caller_closing = [
+                                "thank you", "thanks", "bye", "ok bye",
+                                "goodbye", "dhanyawad", "shukriya",
+                                "alvida", "that's all", "thats all",
+                            ]
+                            lowered_caller = caller_text.lower()
+                            if (
+                                self._caller_has_spoken
+                                and not self.call_should_end
+                                and any(p in lowered_caller for p in caller_closing)
+                            ):
                                 logger.info(
-                                    f"[{self.call_sid}] collected_info after "
-                                    f"capture_enquiry_info merge: {vars(self.collected_info)}"
+                                    f"[{self.call_sid}] Caller closing phrase detected "
+                                    f"({caller_text!r}) — ending call in 2s."
                                 )
 
-                                function_responses.append(
-                                    genai.types.FunctionResponse(
-                                        name="capture_enquiry_info",
-                                        id=fn.id,
-                                        response={"result": "ok"},
-                                    )
-                                )
+                                async def _delayed_caller_hangup():
+                                    await asyncio.sleep(2)
+                                    if not self.call_should_end:
+                                        self.call_should_end = True
 
-                        # Send every function response for this tool_call
-                        # in a single batched call, as the Live API
-                        # protocol expects when multiple functions were
-                        # invoked together. See the FIX comment above the
-                        # `if response.tool_call:` block for why this
-                        # matters -- sending them one-by-one is what was
-                        # causing the agent to go permanently silent.
-                        if function_responses:
-                            try:
-                                await self._session.send_tool_response(
-                                    function_responses=function_responses
+                                asyncio.create_task(_delayed_caller_hangup())
+
+                if response.tool_call:
+                    function_responses = []
+
+                    for fn in response.tool_call.function_calls:
+
+                        if fn.name == "end_call":
+                            reason = (fn.args or {}).get("reason", "call_completed")
+                            if self._caller_has_spoken:
+                                logger.info(
+                                    f"[{self.call_sid}] end_call tool invoked "
+                                    f"(reason={reason!r}) — setting call_should_end."
                                 )
-                            except Exception as e:
+                                self.call_should_end = True
+                            else:
                                 logger.warning(
-                                    f"[{self.call_sid}] Could not send batched "
-                                    f"tool response(s) ({[fr.name for fr in function_responses]}): {e}"
+                                    f"[{self.call_sid}] end_call invoked before caller spoke "
+                                    f"— ignoring (too early)."
+                                )
+                            function_responses.append(
+                                genai.types.FunctionResponse(
+                                    name="end_call",
+                                    id=fn.id,
+                                    response={"result": "ok"},
+                                )
+                            )
+
+                        elif fn.name == "transfer_call":
+                            destination = (fn.args or {}).get("destination", "")
+                            reason = (fn.args or {}).get("reason", "transfer_requested")
+                            logger.info(
+                                f"[{self.call_sid}] transfer_call tool invoked "
+                                f"(destination={destination!r}, reason={reason!r})."
+                            )
+                            self.transfer_requested = True
+                            self.transfer_reason = reason
+                            self._transfer_destination = destination
+                            function_responses.append(
+                                genai.types.FunctionResponse(
+                                    name="transfer_call",
+                                    id=fn.id,
+                                    response={"result": "transferring"},
+                                )
+                            )
+
+                        elif fn.name == "capture_enquiry_info":
+                            args = fn.args or {}
+                            logger.info(
+                                f"[{self.call_sid}] capture_enquiry_info tool "
+                                f"invoked — args={args}"
+                            )
+
+                            raw_grade = args.get("grade") or None
+                            grade_code = grade_to_code(raw_grade)
+                            if raw_grade and grade_code is None:
+                                logger.warning(
+                                    f"[{self.call_sid}] capture_enquiry_info "
+                                    f"reported grade {raw_grade!r} but it did "
+                                    f"not match any known SchoolKnot grade — "
+                                    f"leaving admission_opted_for unset rather "
+                                    f"than sending a possibly-wrong code."
                                 )
 
-                # --- Turn complete: reset playback tracking for the next
-                # response (only if we didn't just break out due to an
-                # interruption, which already reset it inside
-                # _handle_interruption()). This covers the normal case
-                # where the agent finished speaking without being cut off.
-                self._response_started_at = None
-                self._audio_ms_sent = 0.0
+                            raw_callback_time = args.get("callback_time") or None
+                            normalized_callback_time = _normalize_callback_time(
+                                raw_callback_time, self.call_sid
+                            )
 
-                # --- Turn complete: evaluate the FULL utterance now ---
-                full_turn_text = "".join(turn_text_parts).lower()
+                            visit_val = args.get("visit_requested")
+                            chunk_info = EnquiryInfo(
+                                lead_id=self.call_sid,
+                                child_name=(args.get("child_name") or None),
+                                father_name=(args.get("father_name") or None),
+                                mother_name=(args.get("mother_name") or None),
+                                dob=(args.get("dob") or None),
+                                admission_opted_for=grade_code,
+                                email=(args.get("email") or None),
+                                mother_mobile=(args.get("mother_mobile") or None),
+                                branch_name=(args.get("branch") or None),
+                                callback_time=normalized_callback_time,
+                                visit_requested=bool(visit_val) if visit_val is not None else False,
+                            )
 
-                if full_turn_text:
+                            self._merge_info(chunk_info)
+                            upsert_info(self.collected_info)
 
-                    if self._caller_has_spoken and not self.transfer_requested and any(
-                        p in full_turn_text for p in _TRANSFER_PHRASES
-                    ):
-                        self.transfer_requested = True
-                        self.transfer_reason = "ai_initiated_transfer"
-                        logger.info(
-                            f"[{self.call_sid}] Transfer intent detected in AI speech."
-                        )
+                            logger.info(
+                                f"[{self.call_sid}] collected_info after "
+                                f"capture_enquiry_info merge: {vars(self.collected_info)}"
+                            )
 
-                    if self._caller_has_spoken and not self.call_should_end and any(
-                        p in full_turn_text for p in _CALL_ENDING_PHRASES
-                    ):
-                        self.call_should_end = True
-                        logger.info(
-                            f"[{self.call_sid}] Call-ending phrase detected in AI speech "
-                            f"(full turn, not a partial chunk match)."
-                        )
+                            function_responses.append(
+                                genai.types.FunctionResponse(
+                                    name="capture_enquiry_info",
+                                    id=fn.id,
+                                    response={"result": "ok"},
+                                )
+                            )
 
-        except asyncio.CancelledError:
-            pass
+                    if function_responses:
+                        try:
+                            await self._session.send_tool_response(
+                                function_responses=function_responses
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[{self.call_sid}] Could not send batched "
+                                f"tool response(s) ({[fr.name for fr in function_responses]}): {e}"
+                            )
 
-        except Exception as e:
-            logger.error(
-                f"[{self.call_sid}] *** GEMINI RECEIVE LOOP DIED *** {type(e).__name__}: {e} "
-                f"-- this is why the call goes silent. Check API quota / concurrent "
-                f"session limits / network.",
-                exc_info=True
-            )
+            self._response_started_at = None
+            self._audio_ms_sent = 0.0
 
-        finally:
-            try:
-                self.output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            full_turn_text = "".join(turn_text_parts).lower()
+
+            if full_turn_text:
+                if self._caller_has_spoken and not self.transfer_requested and any(
+                    p in full_turn_text for p in _TRANSFER_PHRASES
+                ):
+                    self.transfer_requested = True
+                    self.transfer_reason = "ai_initiated_transfer"
+                    logger.info(
+                        f"[{self.call_sid}] Transfer intent detected in AI speech."
+                    )
+
+                if self._caller_has_spoken and not self.call_should_end and any(
+                    p in full_turn_text for p in _CALL_ENDING_PHRASES
+                ):
+                    self.call_should_end = True
+                    logger.info(
+                        f"[{self.call_sid}] Call-ending phrase detected in AI speech "
+                        f"(full turn, not a partial chunk match)."
+                    )
 
     def full_transcript(self) -> str:
         return " ".join(self.transcript_parts)
 
     def structured_transcript(self) -> list[dict]:
-        """Turn-by-turn transcript for storage (e.g. MongoDB).
-        Each item: {"speaker": "agent"|"caller", "text": str, "timestamp": datetime}.
-        """
         return self.transcript_turns
 
     def _merge_info(self, chunk: EnquiryInfo):
-        """Merges school-admission fields. Mirrors the
-        same COALESCE-style merge enquiry_info.upsert() also does; kept
-        here too so self.collected_info reflects the merge immediately
-        within this call, without waiting on the (possibly swapped-out)
-        storage layer in upsert_info().
-
-        Called from BOTH sources now:
-          - the LLM's capture_enquiry_info tool call (primary)
-          - the regex extractor in school_extractor.py (fallback)
-        Since this only ever fills a field that is currently None (never
-        overwrites an existing value with None), it's safe for both
-        sources to call this on the same collected_info without one
-        clobbering the other.
-        """
-
         info = self.collected_info
 
         if chunk.child_name is not None:
